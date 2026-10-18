@@ -101,18 +101,27 @@ def dequant(wq):
     return ext().w4_dequant(wq.packed_mma, wq.scales, wq.group, True)
 
 
-# version 0 (auto) picks by batch size from the A1 sweep on a T4, all on the one v5 layout: the v6 GEMV for a
-# single row, the tensor-core v5 up to 64 rows, then dequantize + cuBLAS
-AUTO_GEMV_ROWS, AUTO_V5_ROWS = 1, 64
+# version 0 (auto) picks by batch size and layer width from the A1 sweep on a T4 (commit 35dc86c), all on the one
+# v5 layout: the v6 GEMV for a single row; v5 up to 32 rows on every layer (at most 0.78x the time of dequantize
+# + cuBLAS); 33-64 rows only on wide layers, N >= 3072 (0.56-0.77x there, but 1.02-1.34x on the narrow and
+# long-K ones); then dequantize + cuBLAS. Running longer inputs through v5 in 64-row slices lost on every
+# shape from 128 rows.
+AUTO_GEMV_ROWS, AUTO_V5_ROWS, AUTO_V5_WIDE_ROWS, AUTO_WIDE_N = 1, 32, 64, 3072
+
+
+def gemm_chunked(x, wq, chunk=64):
+    """Many rows through v5 in 64-row slices (no FP16 weight copy is written). Kept for the A1 sweep, which shows
+    it losing to dequantize + cuBLAS on every shape from 128 rows, so linear() does not use it."""
+    return torch.cat([gemv(x[i:i + chunk], wq, 5) for i in range(0, x.shape[0], chunk)])
 
 
 def linear(x, wq, max_gemv_rows=8, version=0):
-    """Decode (few rows): an INT4 kernel (v4 GEMV, or v5 tensor cores up to 64 rows). Prefill (many rows):
+    """Decode (few rows): an INT4 kernel (v6 GEMV for one row, v5 tensor cores beyond). Prefill (many rows):
     dequantize, then cuBLAS FP16 GEMM."""
     m = x.shape[0]
     if version == 0:
         version = 6 if m <= AUTO_GEMV_ROWS else 5
-        limit = AUTO_V5_ROWS if version == 5 else max_gemv_rows
+        limit = max_gemv_rows if version == 6 else AUTO_V5_WIDE_ROWS if wq.n >= AUTO_WIDE_N else AUTO_V5_ROWS
     else:
         limit = 64 if version == 5 else max_gemv_rows
     if m <= limit:

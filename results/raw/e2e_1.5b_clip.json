@@ -1,0 +1,207 @@
+{
+ "env": {
+  "gpu": "Tesla T4",
+  "sm": "7.5",
+  "sms": 40,
+  "nvidia_smi": "Tesla T4, 580.178.04, 5001 MHz, 15360 MiB\nTesla T4, 580.178.04, 5001 MHz, 15360 MiB",
+  "torch": "2.11.0+cu128",
+  "cuda": "12.8",
+  "python": "3.13.15",
+  "commit": "f2a9e7d-dirty",
+  "time_utc": "2026-10-18T02:00:20Z"
+ },
+ "model": "Qwen/Qwen2.5-1.5B-Instruct",
+ "clip_search": true,
+ "gemv_version": 0,
+ "layers_replaced": 196,
+ "int4_linear_bytes": 675569664,
+ "quantize_seconds": 4.37146782875061,
+ "fp16": {
+  "label": "fp16",
+  "weight_bytes": 3087428608,
+  "wikitext2": {
+   "windows": 40,
+   "ctx": 1024,
+   "tokens": 40920,
+   "ppl": 10.653897285461426
+  },
+  "eager": {
+   "prompt_tokens": 65,
+   "new_tokens": 256,
+   "ttft_ms": 41.535165999903256,
+   "decode_tokens_per_s": 29.23157667516762
+  },
+  "cuda_graph": {
+   "prompt_tokens": 65,
+   "new_tokens": 256,
+   "ttft_ms": 42.52383400000781,
+   "decode_tokens_per_s": 51.37932222224076
+  },
+  "profile": {
+   "steps": 32,
+   "wall_ms": 1921.185434999984,
+   "gpu_kernel_ms": 352.7883080000004,
+   "gpu_busy_pct": 18.363053434246098,
+   "share_pct": {
+    "int4_kernels": 0.0,
+    "gemm": 72.88152247948064,
+    "dequant": 0.0,
+    "other": 27.11847752051936
+   },
+   "top_kernels": [
+    {
+     "name": "void gemv2T_kernel_val<int, int, __half, __half, __half, float, 128, 16, 4, 4, false, fals",
+     "ms": 221.208020000002
+    },
+    {
+     "name": "void gemv2T_kernel_val<int, int, __half, __half, __half, float, 128, 16, 4, 4, false, true",
+     "ms": 19.75238499999816
+    },
+    {
+     "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::Tenso",
+     "ms": 13.239946000008185
+    },
+    {
+     "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::MeanOps<flo",
+     "ms": 8.601988000001517
+    },
+    {
+     "name": "turing_fp16_s1688gemm_fp16_256x64_sliced1x2_ldg8_f2f_tn",
+     "ms": 8.416481999999997
+    },
+    {
+     "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native:",
+     "ms": 8.307838999995507
+    },
+    {
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<c10::Half>, ",
+     "ms": 5.719269000003085
+    },
+    {
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::float16_copy_kernel_cuda(at:",
+     "ms": 5.370130000003292
+    },
+    {
+     "name": "void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::native::(anonymous namespa",
+     "ms": 5.13347000000352
+    },
+    {
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<c10::Half, c10",
+     "ms": 5.084807999996334
+    },
+    {
+     "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native:",
+     "ms": 4.6103460000025045
+    },
+    {
+     "name": "turing_fp16_s1688gemm_fp16_128x64_sliced1x2_ldg8_f2f_tn",
+     "ms": 4.5453450000000215
+    }
+   ]
+  },
+  "peak_mem_bytes": 4652532736
+ },
+ "fake_quant": {
+  "label": "fake_quant",
+  "weight_bytes": 3087428608,
+  "wikitext2": {
+   "windows": 40,
+   "ctx": 1024,
+   "tokens": 40920,
+   "ppl": 12.391136169433594,
+   "next_token_agreement_with_fp16": 0.802174985408783
+  }
+ },
+ "int4": {
+  "label": "int4_w4a16_g128_clip",
+  "weight_bytes": 1142606848,
+  "wikitext2": {
+   "windows": 40,
+   "ctx": 1024,
+   "tokens": 40920,
+   "ppl": 12.392158508300781,
+   "next_token_agreement_with_fp16": 0.8022482991218567
+  },
+  "eager": {
+   "prompt_tokens": 65,
+   "new_tokens": 256,
+   "ttft_ms": 58.193735000031666,
+   "decode_tokens_per_s": 25.048111503968865
+  },
+  "cuda_graph": {
+   "prompt_tokens": 65,
+   "new_tokens": 256,
+   "ttft_ms": 59.04498699987926,
+   "decode_tokens_per_s": 89.83655773996027
+  },
+  "profile": {
+   "steps": 32,
+   "wall_ms": 1815.5022180001197,
+   "gpu_kernel_ms": 275.56257499998225,
+   "gpu_busy_pct": 15.17831111787516,
+   "share_pct": {
+    "int4_kernels": 50.80671930867352,
+    "gemm": 0.26774680850616517,
+    "dequant": 0.0,
+    "other": 48.925533882820325
+   },
+   "top_kernels": [
+    {
+     "name": "void (anonymous namespace)::gemv_v6<1, 4>(__half const*, uint4 const*, __half const*, __ha",
+     "ms": 115.68560499999495
+    },
+    {
+     "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::Tenso",
+     "ms": 18.524175000004828
+    },
+    {
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<c10::Half>, ",
+     "ms": 13.57024599999858
+    },
+    {
+     "name": "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native:",
+     "ms": 11.259649999994705
+    },
+    {
+     "name": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::MeanOps<flo",
+     "ms": 10.870383000002068
+    },
+    {
+     "name": "void (anonymous namespace)::gemv_v6<1, 1>(__half const*, uint4 const*, __half const*, __ha",
+     "ms": 10.235174999999014
+    },
+    {
+     "name": "void (anonymous namespace)::gemm_v5<8, 1>(__half const*, uint4 const*, __half const*, __ha",
+     "ms": 8.006485999999947
+    },
+    {
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::float16_copy_kernel_cuda(at:",
+     "ms": 7.448323000000973
+    },
+    {
+     "name": "void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::native::(anonymous namespa",
+     "ms": 6.903046000001571
+    },
+    {
+     "name": "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<c10::Half, c10",
+     "ms": 6.591759000000351
+    },
+    {
+     "name": "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native:",
+     "ms": 6.533363999999283
+    },
+    {
+     "name": "void (anonymous namespace)::gemm_v5<8, 2>(__half const*, uint4 const*, __half const*, __ha",
+     "ms": 6.077038000000037
+    }
+   ]
+  },
+  "peak_mem_bytes": 2765644800
+ },
+ "int4_vs_fake_quant_next_token_agreement": 0.9974095821380615,
+ "int4_vs_fake_quant_ppl_rel_diff": 8.25056599498275e-05,
+ "greedy_identical_prefix_graph": 9,
+ "ppl_delta": 1.7382612228393555,
+ "speedup_decode_eager": 0.8568854079378951,
+ "speedup_decode_cuda_graph": 1.7484963571799004
+}

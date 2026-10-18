@@ -172,10 +172,14 @@ def bench(shapes, rows_decode, rows_prefill, peak):
             for kname, (v, rpw) in KERNELS.items():
                 if m <= 8 or (v == 5 and m <= 64):
                     r[kname] = timed(lambda v=v, rpw=rpw: ops.gemv(x, pick(wqs), v, rpw))
+            if 64 < m <= 512:
+                r["v5_chunked"] = timed(lambda: ops.gemm_chunked(x, pick(wqs)))
             for key in [kk for kk in r if isinstance(r[kk], dict)]:
                 moved = (w16_bytes if key == "fp16_cublas" else w4_bytes) + act
                 if key == "dequant_cublas":
                     moved = w4_bytes + 2 * w16_bytes + act    # dequant writes fp16 W, the GEMM reads it back
+                if key == "v5_chunked":
+                    moved = -(-m // 64) * w4_bytes + act      # each 64-row slice reads the INT4 weight again
                 if key == "dequant_only":
                     moved = w4_bytes + w16_bytes
                 r[key]["gbps"] = moved / (r[key]["us"] * 1e-6) / 1e9
@@ -210,7 +214,7 @@ def main():
         result["bandwidth"] = bw
         result["spec_bandwidth_gbps"] = 320.0 if "T4" in result["env"]["gpu"] else None
         print(f"bandwidth {bw}", flush=True)
-        result["bench"] = bench(shapes, [1, 2, 4, 8], [16, 32, 64] if a.quick else [16, 32, 64, 128, 256, 512, 1024], peak)
+        result["bench"] = bench(shapes, [1, 2, 4, 8], [16, 32, 64] if a.quick else [16, 32, 64, 65, 96, 128, 192, 256, 384, 512, 1024], peak)
     pathlib.Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(a.out).write_text(json.dumps(result, indent=1))
     sys.exit(0 if ok else 1)

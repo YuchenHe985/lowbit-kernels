@@ -1,0 +1,29 @@
+/usr/local/cuda/bin/compute-sanitizer --tool memcheck --error-exitcode 3 /usr/bin/python3 memcheck.py
+========= COMPUTE-SANITIZER
+========= Program hit CUDA_ERROR_INVALID_HANDLE (error 400) due to "invalid resource handle" on CUDA API call to cuKernelGetFunction.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x3a997] in libcudart.so.12
+=========         Host Frame: cudaLaunchKernel [0x79f19] in libcudart.so.12
+=========         Host Frame: void (anonymous namespace)::launch<1>(int, int, __half const*, unsigned char const*, __half const*, __half*, int, int, int, CUstream_st*) [0x213a7] in lowbit_w4.so
+=========         Host Frame: w4_gemv(at::Tensor, at::Tensor, at::Tensor, long, long, long) [0x12217] in lowbit_w4.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(at::Tensor, at::Tensor, at::Tensor, long, long, long), at::Tensor, at::Tensor, at::Tensor, at::Tensor, long, long, long, pybind11::name, pybind11::scope, pybind11::sibling, char [94], pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg, pybind11::arg_v>(at::Tensor (*&)(at::Tensor, at::Tensor, at::Tensor, long, long, long), at::Tensor (*)(at::Tensor, at::Tensor, at::Tensor, long, long, long), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, char const (&) [94], pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg const&, pybind11::arg_v const&)::{lambda(pybind11::detail::function_call&)#1}::_FUN(pybind11::detail::function_call&) [0x3bb2c] in lowbit_w4.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object*, _object*) [0x387b9] in lowbit_w4.so
+=========         Host Frame:  [0x191fe2] in python3
+=========         Host Frame: _PyObject_MakeTpCall [0x16e212] in python3
+=========         Host Frame:  [0x402e5] in python3
+=========         Host Frame: PyEval_EvalCode [0x24d829] in python3
+=========         Host Frame:  [0x289ad1] in python3
+=========         Host Frame:  [0x286c8d] in python3
+=========         Host Frame:  [0x28380a] in python3
+=========         Host Frame:  [0x2830d3] in python3
+=========         Host Frame:  [0x282ec4] in python3
+=========         Host Frame: Py_RunMain [0x28191f] in python3
+=========         Host Frame: Py_BytesMain [0x23c9bc] in python3
+=========         Host Frame:  [0x2a1c9] in libc.so.6
+=========         Host Frame: __libc_start_main [0x2a28a] in libc.so.6
+=========         Host Frame: _start [0x23be54] in python3
+=========         Host Frame: gemv in ops.py:50
+=========         Host Frame: <module> in memcheck.py:7
+========= 
+memcheck workload done
+========= ERROR SUMMARY: 1 error
