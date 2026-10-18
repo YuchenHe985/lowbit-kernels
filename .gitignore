@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+kernel/
+results/kaggle/
+.DS_Store
+.pytest_cache/
