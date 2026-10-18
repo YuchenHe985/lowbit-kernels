@@ -17,7 +17,7 @@ git = lambda *a: subprocess.run(["git", "-C", str(root), *a], capture_output=Tru
 commit = (git("rev-parse", "--short", "HEAD") or "uncommitted") + ("-dirty" if git("status", "--porcelain") else "")
 files = {p: (root / p).read_text() for p in
          ["lowbit/__init__.py", "lowbit/quant.py", "lowbit/ops.py", "lowbit/model.py", "csrc/w4_gemv.cu",
-          "bench/gpu_run.py", "bench/e2e.py", "tests/test_quant.py"]}
+          "bench/gpu_run.py", "bench/e2e.py", "bench/ncu_dram.py", "tests/test_quant.py", "tests/test_dispatch.py"]}
 script = f'''import os, pathlib, subprocess, sys
 FILES = {files!r}
 MODE = {mode!r}
@@ -63,6 +63,14 @@ if os.path.exists(san):
         return r.returncode
     if san_run([], "all") and san_run(["--report-api-errors", "no"], "memory_only"):
         sys.exit("memcheck found memory-access errors")
+    # shared-memory races (v5 reduces through shared memory) and barrier misuse
+    for tool in ("racecheck", "synccheck"):
+        cmd = [san, "--tool", tool, "--error-exitcode", "3", sys.executable, "memcheck.py"]
+        r = subprocess.run(cmd, env=dict(env, CUDA_MODULE_LOADING="EAGER"), capture_output=True, text=True)
+        pathlib.Path(f"results/{{tool}}.txt").write_text(" ".join(cmd) + "\\n" + r.stdout + r.stderr)
+        print(tool, "exit", r.returncode, r.stdout[-400:], flush=True)
+        if r.returncode:
+            sys.exit(f"{{tool}} found errors")
 else:
     print("compute-sanitizer not found in this image", flush=True)
 if MODE == "e2e":
@@ -72,6 +80,15 @@ if MODE == "e2e":
                  "--out", f"results/e2e_{{size.lower()}}{{'_clip' if clip else ''}}.json"] + clip, check=False)
 else:
     run([sys.executable, "bench/gpu_run.py", "--out", "results/a1.json"] + (["--quick"] if MODE == "quick" else []))
+    ncu = "/usr/local/cuda/bin/ncu"
+    if os.path.exists(ncu):                                 # DRAM byte counters (may need permissions the VM lacks)
+        r = subprocess.run([ncu, "--csv", "--cache-control", "all", "--metrics",
+                            "dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum",
+                            sys.executable, "bench/ncu_dram.py"], env=env, capture_output=True, text=True)
+        pathlib.Path("results/ncu_dram.csv").write_text(r.stdout + "\\n# stderr\\n" + r.stderr[-3000:])
+        print("ncu exit", r.returncode, r.stderr[-400:], flush=True)
+    else:
+        print("ncu not found in this image", flush=True)
 subprocess.run(["cp", "-r", "results", "/kaggle/working/"])
 print("DONE", flush=True)
 '''

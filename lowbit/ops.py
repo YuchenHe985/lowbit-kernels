@@ -18,20 +18,34 @@ def ext():
     return _EXT
 
 
+LAYOUTS = ("canonical", "v3", "mma")
+
+
 class W4Weight:
     """One linear layer's weight in the lowbit/quant.py format, on the GPU. `layouts` picks which copies to keep:
-    canonical (v1, v2, dequantize), v3 (v3, v4), mma (v5). The benchmark keeps all three; a model keeps what it uses."""
+    canonical (v1, v2, dequantize), v3 (v3, v4), mma (v5, v6, dequantize; needs K and the group size to be
+    multiples of 128). None = every layout this shape supports (the benchmark); a model keeps ("mma",). Prefill
+    dequantizes, so one of canonical / mma must be kept."""
 
-    def __init__(self, packed, scales, group, layouts=("canonical", "v3", "mma")):
+    def __init__(self, packed, scales, group, layouts=None):
         self.group = group
         self.n, self.k = packed.shape[0], packed.shape[1] * 2
+        mma_ok = self.k % 128 == 0 and group % 128 == 0
+        if layouts is None:
+            layouts = LAYOUTS if mma_ok else ("canonical", "v3")
+        if not set(layouts) <= set(LAYOUTS):
+            raise ValueError(f"unknown layout in {layouts}; choose from {LAYOUTS}")
+        if "mma" in layouts and not mma_ok:
+            raise ValueError(f"the mma layout needs K and the group size to be multiples of 128 (K={self.k}, G={group})")
+        if "canonical" not in layouts and "mma" not in layouts:
+            raise ValueError("keep the canonical or the mma layout: prefill dequantizes from one of them")
         self.packed = torch.from_numpy(packed).cuda() if "canonical" in layouts else None
         self.packed_v3 = torch.from_numpy(quant.interleave_for_gpu(packed)).cuda() if "v3" in layouts else None
         self.packed_mma = torch.from_numpy(quant.interleave_for_mma(packed)).cuda() if "mma" in layouts else None
         self.scales = torch.from_numpy(scales).cuda()
 
     @classmethod
-    def from_float(cls, w, group=128, layouts=("canonical", "v3", "mma")):
+    def from_float(cls, w, group=128, layouts=None):
         packed, scales = quant.quantize_w4(w.detach().float().cpu().numpy(), group)
         return cls(packed, scales, group, layouts)
 
@@ -40,10 +54,24 @@ class W4Weight:
         return self.n * self.k // 2 + self.scales.numel() * 2
 
 
+def pick_rows(n, m):
+    """Rows per warp v4/v6 use when rows_per_warp = 0 (mirror of pick_rows in csrc/w4_gemv.cu, for the records)."""
+    return 4 if n >= 512 else 2 if m >= 4 else 1
+
+
+# the layout each kernel version reads, and the most rows it takes
+NEEDS = {1: "packed", 2: "packed", 3: "packed_v3", 4: "packed_v3", 5: "packed_mma", 6: "packed_mma"}
+MAX_ROWS = {1: 8, 2: 8, 3: 8, 4: 8, 5: 64, 6: 8}
+
+
 def gemv(x, wq, version=4, rows_per_warp=0):
     """x [M, K] fp16 -> [M, N] fp16. v1-v4, v6: M <= 8 (rows_per_warp for v4/v6, 0 = chosen from N and M);
     v5: tensor cores, M <= 64 (rows_per_warp = 16-row tiles per warp, 1/2/4, 0 = chosen from N and M).
     v5 and v6 read the same layout (packed_mma), so a model needs only that copy."""
+    if version not in NEEDS:
+        raise ValueError(f"version must be one of {sorted(NEEDS)}")
+    if getattr(wq, NEEDS[version]) is None:
+        raise ValueError(f"v{version} reads {NEEDS[version]}, which this W4Weight does not keep")
     if version == 5:
         return ext().w4_gemm_tc(x.contiguous(), wq.packed_mma, wq.scales, wq.group, rows_per_warp)
     w = wq.packed_mma if version == 6 else wq.packed_v3 if version >= 3 else wq.packed
@@ -95,10 +123,15 @@ def dequantize_w4_gpu(packed, scales, group=128):
     return (u.reshape(n, k // group, group) * scales.float()[..., None]).reshape(n, k).half()
 
 
-def dequant(wq):
-    if wq.packed is not None:
+def dequant(wq, layout=None):
+    """fp16 W [N, K] from the canonical or the mma copy (None: canonical when kept). Both give the same bits."""
+    if layout is None:
+        layout = "canonical" if wq.packed is not None else "mma"
+    if layout == "canonical" and wq.packed is not None:
         return ext().w4_dequant(wq.packed, wq.scales, wq.group)
-    return ext().w4_dequant(wq.packed_mma, wq.scales, wq.group, True)
+    if layout == "mma" and wq.packed_mma is not None:
+        return ext().w4_dequant(wq.packed_mma, wq.scales, wq.group, True)
+    raise ValueError(f"cannot dequantize from the {layout} layout: not kept")
 
 
 # version 0 (auto) picks by batch size and layer width from the A1 sweep on a T4 (commit 35dc86c), all on the one
@@ -115,15 +148,31 @@ def gemm_chunked(x, wq, chunk=64):
     return torch.cat([gemv(x[i:i + chunk], wq, 5) for i in range(0, x.shape[0], chunk)])
 
 
+def auto_version(m, wq):
+    """The kernel linear() uses for m rows, or None for dequantize + cuBLAS. Weights without the mma layout (K or
+    the group size not a multiple of 128) use v4 / v2 up to 8 rows."""
+    if wq.packed_mma is not None:
+        if m <= AUTO_GEMV_ROWS:
+            return 6
+        return 5 if m <= (AUTO_V5_WIDE_ROWS if wq.n >= AUTO_WIDE_N else AUTO_V5_ROWS) else None
+    if m <= 8:
+        return 4 if wq.packed_v3 is not None else 2 if wq.packed is not None else None
+    return None
+
+
 def linear(x, wq, max_gemv_rows=8, version=0):
     """Decode (few rows): an INT4 kernel (v6 GEMV for one row, v5 tensor cores beyond). Prefill (many rows):
-    dequantize, then cuBLAS FP16 GEMM."""
+    dequantize, then cuBLAS FP16 GEMM. version 0 = auto_version; a fixed version runs up to
+    min(max_gemv_rows, its row limit) rows (v5: 64), and dequantize + cuBLAS above that."""
     m = x.shape[0]
+    if m == 0:
+        return x.new_empty(0, wq.n)
     if version == 0:
-        version = 6 if m <= AUTO_GEMV_ROWS else 5
-        limit = max_gemv_rows if version == 6 else AUTO_V5_WIDE_ROWS if wq.n >= AUTO_WIDE_N else AUTO_V5_ROWS
+        v = auto_version(m, wq)
+    elif version in MAX_ROWS:
+        v = version if m <= (MAX_ROWS[5] if version == 5 else min(max_gemv_rows, MAX_ROWS[version])) else None
     else:
-        limit = 64 if version == 5 else max_gemv_rows
-    if m <= limit:
-        return gemv(x, wq, version)
-    return torch.nn.functional.linear(x, dequant(wq))
+        raise ValueError(f"version must be 0 (auto) or one of {sorted(MAX_ROWS)}")
+    if v is not None:
+        return gemv(x, wq, v)
+    return torch.nn.functional.linear(x, dequant(wq, "mma" if wq.packed_mma is not None else "canonical"))   # the model's copy

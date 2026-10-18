@@ -5,7 +5,8 @@
 //   v1  one thread per output row, byte loads, fp32 math              (the "obvious" kernel)
 //   v2  one warp per output row, 128-bit loads (32 weights per lane per step), fp32 math, shuffle reduction
 //   v3  v2 + offline-interleaved nibbles and the 0x6400 magic-number trick: a mask and an OR turn eight
-//       nibbles into four fp16 pairs, multiplied with HFMA2 against consecutive activations
+//       nibbles into four fp16 pairs, scaled to the fp16 weights the dequantize kernel writes, multiplied with
+//       HFMA2 against consecutive activations
 //   v4  v3 + R output rows per warp: each activation load is reused for R rows (v2/v3 re-read x from L1 for
 //       every row, M times the weight bytes, which made time grow with M), and R weight loads are in flight
 //       per step instead of one; R is chosen from N so the grid still fills the GPU
@@ -20,6 +21,7 @@
 // plus dequantize kernels (canonical or v5 layout -> fp16 W) for the prefill path, where cuBLAS wins.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 #include <cstdint>
 
@@ -107,14 +109,14 @@ __global__ void gemv_v3(const half* __restrict__ x, const uint4* __restrict__ w,
   for (int c = lane; c < K / 32; c += 32) {
     uint4 wv = __ldg(wrow + c);
     const uint32_t words[4] = {wv.x, wv.y, wv.z, wv.w};
-    float sc = __half2float(srow[(c * 32) / G]);
+    const half2 sc = __half2half2(srow[(c * 32) / G]);
     half2 wh[16];                                           // wh[4i+j] = (W[k0+8i+2j], W[k0+8i+2j+1])
 #pragma unroll
     for (int i = 0; i < 4; ++i)
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         uint32_t t = ((words[i] >> (4 * j)) & 0x000F000Fu) | 0x64006400u;
-        wh[4 * i + j] = __hsub2(*reinterpret_cast<half2*>(&t), bias);
+        wh[4 * i + j] = __hmul2(__hsub2(*reinterpret_cast<half2*>(&t), bias), sc);
       }
 #pragma unroll
     for (int m = 0; m < M; ++m) {
@@ -124,8 +126,10 @@ __global__ void gemv_v3(const half* __restrict__ x, const uint4* __restrict__ w,
       for (int i = 0; i < 4; ++i) {
         uint4 xv = __ldg(xp + i);
         const half2* xh = reinterpret_cast<const half2*>(&xv);
-        // 8 products per fp16 partial before widening to fp32: overflow needs |x| > ~1000, and the rounding
-        // error stays at fp16 precision over 8 terms instead of 32
+        // 8 products per fp16 partial before widening to fp32. The weights are scaled first (q * scale, rounded
+        // once to fp16: bit-identical to the dequantized weights), so a partial holds 8 true terms of the output
+        // and overflows only where 8 terms of an fp16 GEMM would; scaling after the sum let |x| > ~2000 overflow
+        // a 7 * x partial to inf on a finite output
         half2 p = __hmul2(wh[4 * i], xh[0]);
         p = __hfma2(wh[4 * i + 1], xh[1], p);
         p = __hfma2(wh[4 * i + 2], xh[2], p);
@@ -133,7 +137,7 @@ __global__ void gemv_v3(const half* __restrict__ x, const uint4* __restrict__ w,
         float2 f = __half22float2(p);
         part += f.x + f.y;
       }
-      acc[m] += part * sc;
+      acc[m] += part;
     }
   }
 #pragma unroll
@@ -158,12 +162,12 @@ __global__ void gemv_v4(const half* __restrict__ x, const uint4* __restrict__ w,
     for (int m = 0; m < M; ++m) acc[r][m] = 0.f;
   for (int c = lane; c < KC; c += 32) {
     uint4 wv[R];
-    float sc[R];
+    half2 sc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) {                           // rows past N re-read row N-1; their sums are dropped
       int n = min(n0 + r, N - 1);
       wv[r] = __ldg(w + (size_t)n * KC + c);
-      sc[r] = __half2float(s[(size_t)n * KG + (c * 32) / G]);
+      sc[r] = __half2half2(s[(size_t)n * KG + (c * 32) / G]);
     }
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -174,7 +178,7 @@ __global__ void gemv_v4(const half* __restrict__ x, const uint4* __restrict__ w,
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           uint32_t t = ((word >> (4 * j)) & 0x000F000Fu) | 0x64006400u;
-          wh[r][j] = __hsub2(*reinterpret_cast<half2*>(&t), bias);
+          wh[r][j] = __hmul2(__hsub2(*reinterpret_cast<half2*>(&t), bias), sc[r]);   // scaled first, as in v3
         }
       }
 #pragma unroll
@@ -188,7 +192,7 @@ __global__ void gemv_v4(const half* __restrict__ x, const uint4* __restrict__ w,
           p = __hfma2(wh[r][2], xh[2], p);
           p = __hfma2(wh[r][3], xh[3], p);
           float2 f = __half22float2(p);
-          acc[r][m] += (f.x + f.y) * sc[r];
+          acc[r][m] += f.x + f.y;
         }
       }
     }
@@ -307,6 +311,8 @@ __global__ void dequant_kernel(const uint32_t* __restrict__ w, const half* __res
 
 void check(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& s, int64_t group) {
   TORCH_CHECK(x.is_cuda() && w.is_cuda() && s.is_cuda(), "tensors must be on the GPU");
+  TORCH_CHECK(w.device() == x.device() && s.device() == x.device(), "x, w and scales must be on the same GPU");
+  TORCH_CHECK(group > 0, "group size must be positive");
   TORCH_CHECK(x.scalar_type() == torch::kHalf && s.scalar_type() == torch::kHalf && w.scalar_type() == torch::kUInt8,
               "x and scales must be float16, packed weights uint8");
   TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && s.is_contiguous(), "tensors must be contiguous");
@@ -335,12 +341,12 @@ __global__ void gemv_v6(const half* __restrict__ x, const uint4* __restrict__ w,
     for (int m = 0; m < M; ++m) acc[r][m] = 0.f;
   for (int c = cc; c < KC; c += 8) {
     uint4 wv[R];
-    float sc[R];
+    half2 sc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) {                           // rows past N re-read row N-1; their sums are dropped
       int n = min(n0 + r, N - 1);
       wv[r] = __ldg(w + (size_t)n * (K / 32) + 4 * c + t);
-      sc[r] = __half2float(s[(size_t)n * KG + (c * 128) / G]);
+      sc[r] = __half2half2(s[(size_t)n * KG + (c * 128) / G]);
     }
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -351,7 +357,7 @@ __global__ void gemv_v6(const half* __restrict__ x, const uint4* __restrict__ w,
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           uint32_t u = ((word >> (4 * j)) & 0x000F000Fu) | 0x64006400u;
-          wh[r][j] = __hsub2(*reinterpret_cast<half2*>(&u), bias);
+          wh[r][j] = __hmul2(__hsub2(*reinterpret_cast<half2*>(&u), bias), sc[r]);   // scaled first, as in v3
         }
       }
 #pragma unroll
@@ -370,7 +376,7 @@ __global__ void gemv_v6(const half* __restrict__ x, const uint4* __restrict__ w,
           p = __hfma2(wh[r][2], xh[2], p);
           p = __hfma2(wh[r][3], xh[3], p);
           float2 f = __half22float2(p);
-          acc[r][m] += (f.x + f.y) * sc[r];
+          acc[r][m] += f.x + f.y;
         }
       }
     }
@@ -449,6 +455,7 @@ void launch(int version, int R, const half* x, const uint8_t* w, const half* s, 
 torch::Tensor w4_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor s, int64_t group, int64_t version,
                       int64_t rows_per_warp) {
   check(x, w, s, group);
+  const c10::cuda::CUDAGuard guard(x.device());                  // launch on the tensors' GPU and its stream
   int M = x.size(0), K = x.size(1), N = w.size(0);
   TORCH_CHECK(M >= 1 && M <= 8, "the GEMV kernels take 1..8 rows; use the dequantize + matmul path above that");
   TORCH_CHECK((version >= 1 && version <= 4) || version == 6, "version is 1..4 or 6");
@@ -479,6 +486,7 @@ torch::Tensor w4_gemv(torch::Tensor x, torch::Tensor w, torch::Tensor s, int64_t
 // v5 (tensor cores): w in the interleave_for_mma layout, M <= 64
 torch::Tensor w4_gemm_tc(torch::Tensor x, torch::Tensor w, torch::Tensor s, int64_t group, int64_t row_tiles) {
   check(x, w, s, group);
+  const c10::cuda::CUDAGuard guard(x.device());
   int M = x.size(0), K = x.size(1), N = w.size(0), G = (int)group;
   TORCH_CHECK(M >= 1 && M <= 64, "the tensor-core kernel takes 1..64 rows");
   TORCH_CHECK(K % 128 == 0 && G % 128 == 0, "v5 needs K and the group size to be multiples of 128");
@@ -507,7 +515,10 @@ torch::Tensor w4_gemm_tc(torch::Tensor x, torch::Tensor w, torch::Tensor s, int6
 }
 
 torch::Tensor w4_dequant(torch::Tensor w, torch::Tensor s, int64_t group, bool mma_layout) {
-  TORCH_CHECK(w.is_cuda() && w.scalar_type() == torch::kUInt8 && s.scalar_type() == torch::kHalf, "bad inputs");
+  TORCH_CHECK(w.is_cuda() && s.is_cuda() && w.device() == s.device(), "packed weights and scales must be on the same GPU");
+  TORCH_CHECK(w.scalar_type() == torch::kUInt8 && s.scalar_type() == torch::kHalf, "packed weights uint8, scales float16");
+  TORCH_CHECK(w.dim() == 2 && s.dim() == 2 && group > 0, "w [N,K/2], scales [N,K/G], positive group size");
+  const c10::cuda::CUDAGuard guard(w.device());
   TORCH_CHECK(w.is_contiguous() && s.is_contiguous() && reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
               "packed weights must be contiguous and 16-byte aligned");
   int N = w.size(0), K = w.size(1) * 2;

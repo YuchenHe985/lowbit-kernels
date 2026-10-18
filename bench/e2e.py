@@ -5,7 +5,9 @@ with the INT4 kernels, on a fixed workload.
 
 Quality: WikiText-2 perplexity, and next-token agreement with FP16 over the same tokens (teacher-forced, so one
 early difference does not decide the score). Fake-quant and INT4 multiply by the same weights, so a gap between
-them is a kernel error, while their gap to FP16 is the price of 4-bit weights.
+them is a kernel error, while their gap to FP16 is the price of 4-bit weights. The 1024-token perplexity windows
+run the prefill path (dequantize + cuBLAS); the decode kernels are checked separately (decode_path): the same
+tokens fed through the KV cache 1, 16 and 48 at a time, which runs v6, v5, and v5 on the wide layers only.
 Speed at batch 1: TTFT and decode tokens/s, both in eager mode (what plain `generate` gives) and with each decode
 step captured as one CUDA graph over a static KV cache (how serving engines remove per-step CPU overhead), plus
 where eager decode GPU time goes (profiler, by kernel).
@@ -126,36 +128,93 @@ def speed_graph(tok, m, new_tokens, reps=3):
             "decode_tokens_per_s": (new_tokens - 1) / dec[len(dec) // 2]}, toks.tolist()
 
 
+def dynamic_cache():
+    from transformers import DynamicCache
+    return DynamicCache()
+
+
 @torch.inference_mode()
 def where_time_goes(tok, m, steps=32):
-    """GPU time by kernel over `steps` eager decode steps (profiler); grouped into INT4 kernels / GEMM / the rest."""
+    """Eager decode only (the prompt is prefilled first, outside the window): `steps` single-token steps on the
+    timed workload's prompt, once unprofiled for the wall time, once under the profiler for GPU time by kernel,
+    grouped into INT4 kernels / dense GEMM / dequantize / the rest. GPU busy = profiled kernel time / unprofiled
+    wall time."""
     from torch.profiler import ProfilerActivity, profile
-    ids = tok(PROMPT, return_tensors="pt").input_ids.cuda()
-    kw = dict(do_sample=False, pad_token_id=tok.eos_token_id, max_new_tokens=steps, min_new_tokens=steps)
-    m.generate(ids, **kw)
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    ids = prompt_ids(tok)
+
+    def run():
+        cache = dynamic_cache()
+        nxt = m(input_ids=ids, past_key_values=cache, use_cache=True).logits[:, -1].argmax(-1, keepdim=True)
         torch.cuda.synchronize(); t = time.perf_counter()
-        m.generate(ids, **kw)
-        torch.cuda.synchronize(); wall = time.perf_counter() - t
+        for _ in range(steps):
+            nxt = m(input_ids=nxt, past_key_values=cache, use_cache=True).logits[:, -1].argmax(-1, keepdim=True)
+        torch.cuda.synchronize()
+        return time.perf_counter() - t
+
+    run()
+    wall = sorted(run() for _ in range(3))[1]
+    cache = dynamic_cache()
+    nxt = m(input_ids=ids, past_key_values=cache, use_cache=True).logits[:, -1].argmax(-1, keepdim=True)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:          # the decode steps only
+        for _ in range(steps):
+            nxt = m(input_ids=nxt, past_key_values=cache, use_cache=True).logits[:, -1].argmax(-1, keepdim=True)
+        torch.cuda.synchronize()
     rows = [(e.key, e.device_time_total if hasattr(e, "device_time_total") else e.cuda_time_total)
             for e in prof.key_averages() if getattr(e, "device_type", None) is not None]
     kern = [(k, us) for k, us in rows if us > 0 and not k.startswith(("aten::", "cuda", "Memcpy", "Memset")) and "::" not in k[:6]]
     gpu = sum(us for _, us in kern)
     groups = {"int4_kernels": 0.0, "gemm": 0.0, "dequant": 0.0, "other": 0.0}
     for k, us in kern:
-        g = ("int4_kernels" if ("gemv_v" in k or "gemm_v5" in k) else "dequant" if "dequant_kernel" in k else
+        g = ("int4_kernels" if ("gemv_v" in k or "gemm_v5" in k) else "dequant" if "dequant" in k else
              "gemm" if any(s in k.lower() for s in ("gemm", "gemv", "cutlass", "turing_", "volta_")) else "other")
         groups[g] += us
     top = sorted(kern, key=lambda r: -r[1])[:12]
-    return {"steps": steps, "wall_ms": 1000 * wall, "gpu_kernel_ms": gpu / 1000, "gpu_busy_pct": 100 * gpu / 1000 / (1000 * wall),
+    return {"steps": steps, "scope": "decode only, after prefill", "wall_ms_unprofiled": 1000 * wall,
+            "gpu_kernel_ms": gpu / 1000, "gpu_busy_pct": 100 * gpu / 1000 / (1000 * wall),
             "share_pct": {g: 100 * v / gpu for g, v in groups.items()} if gpu else {},
             "top_kernels": [{"name": k[:90], "ms": us / 1000} for k, us in top]}
 
 
+@torch.inference_mode()
+def decode_path(ids, m, tokens=512, chunks=(1, 16, 48)):
+    """The same `tokens` WikiText tokens fed through the KV cache `chunk` at a time, teacher-forced. In the INT4
+    model chunk 1 runs v6, 16 runs v5 everywhere, 48 runs v5 on wide layers and dequantize + cuBLAS on the rest.
+    Per chunk: next-token NLL and argmax at every position, plus the logits of the first 32 positions."""
+    seq = ids[:tokens + 1].cuda()
+    out = {}
+    for c in chunks:
+        cache, nll, arg, head = dynamic_cache(), [], [], []
+        for i in range(0, tokens, c):
+            x = seq[i:min(i + c, tokens)].unsqueeze(0)
+            logits = m(input_ids=x, past_key_values=cache, use_cache=True).logits[0].float()
+            tgt = seq[i + 1:i + 1 + x.shape[1]]
+            nll.append(torch.nn.functional.cross_entropy(logits, tgt, reduction="none"))
+            arg.append(logits.argmax(-1))
+            if sum(h.shape[0] for h in head) < 32:
+                head.append(logits[:32].half())
+        out[c] = {"nll": torch.cat(nll).cpu(), "argmax": torch.cat(arg).cpu(), "head": torch.cat(head)[:32].cpu()}
+    return out
+
+
+def compare_decode(fake, int4):
+    """INT4 vs fake-quant on identical inputs, per chunk size: perplexity of each, argmax agreement, worst per-token
+    NLL difference and worst logit difference (first 32 positions) relative to the logits' RMS."""
+    res = {}
+    for c in fake:
+        f, q = fake[c], int4[c]
+        rms = f["head"].float().pow(2).mean().sqrt().item()
+        res[str(c)] = {"ppl_fake": float(torch.exp(f["nll"].mean())), "ppl_int4": float(torch.exp(q["nll"].mean())),
+                       "argmax_agreement": float((f["argmax"] == q["argmax"]).float().mean()),
+                       "max_abs_nll_diff": float((f["nll"] - q["nll"]).abs().max()),
+                       "max_logit_diff_rel": float((f["head"].float() - q["head"].float()).abs().max() / rms)}
+    return res
+
+
 def wikitext_ids(tok):
     from datasets import load_dataset
-    text = "\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"])
-    return tok(text, return_tensors="pt").input_ids[0]
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+    return tok("\n\n".join(ds["text"]), return_tensors="pt").input_ids[0], getattr(ds, "_fingerprint", None)
 
 
 @torch.inference_mode()
@@ -190,6 +249,11 @@ def measure(tok, m, label, a, ref_argmax=None, speed=True):
         except Exception as e:                                            # report it, keep the eager numbers
             r["cuda_graph"] = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
         r["profile"] = where_time_goes(tok, m)
+        if toks is not None:                                              # graph replay vs plain generate, same prompt
+            ids = prompt_ids(tok)
+            eager = m.generate(ids, max_new_tokens=a.new_tokens, min_new_tokens=a.new_tokens, do_sample=False,
+                               pad_token_id=tok.eos_token_id)[0, ids.shape[1]:].tolist()
+            r["graph_vs_eager_identical_prefix"] = first_diff(eager, toks)
         r["peak_mem_bytes"] = torch.cuda.max_memory_allocated()
     print(label, json.dumps({k: v for k, v in r.items() if k != "profile"}), flush=True)
     if "profile" in r:
@@ -213,7 +277,7 @@ def main():
     ap.add_argument("--gemv-version", type=int, default=0, help="0 = pick by batch size (ops.linear)")
     a = ap.parse_args()
     tok, m = load(a.model)
-    a.ppl_ids = wikitext_ids(tok)                       # first, so a dataset problem fails before any timing
+    a.ppl_ids, a.ppl_fingerprint = wikitext_ids(tok)                       # first, so a dataset problem fails before any timing
     fp16, ref_argmax, toks16 = measure(tok, m, "fp16", a)
 
     t = time.time()
@@ -222,11 +286,16 @@ def main():
     qsec = time.time() - t
     lbmodel.apply_fake_quant(layers)
     fake, fake_argmax, _ = measure(tok, m, "fake_quant", a, ref_argmax, speed=False)
+    fake_dec = decode_path(a.ppl_ids, m)
     replaced, w4 = lbmodel.apply_int4(layers, gemv_version=a.gemv_version)
     gc.collect(); torch.cuda.empty_cache()
     int4, int4_argmax, toks4 = measure(tok, m, f"int4_w4a16_g128{'_clip' if a.clip else ''}", a, ref_argmax)
+    dec = compare_decode(fake_dec, decode_path(a.ppl_ids, m))
+    print("decode_path", json.dumps(dec), flush=True)
 
-    res = {"env": env(), "model": a.model, "clip_search": a.clip, "gemv_version": a.gemv_version,
+    res = {"env": env(), "model": a.model, "model_revision": getattr(m.config, "_commit_hash", None),
+           "dataset_fingerprint": a.ppl_fingerprint, "clip_search": a.clip, "gemv_version": a.gemv_version,
+           "decode_path_int4_vs_fake_quant": dec,
            "layers_replaced": replaced, "int4_linear_bytes": w4, "quantize_seconds": qsec,
            "fp16": fp16, "fake_quant": fake, "int4": int4,
            "int4_vs_fake_quant_next_token_agreement": float((int4_argmax == fake_argmax).float().mean()),
