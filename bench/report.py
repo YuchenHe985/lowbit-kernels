@@ -11,37 +11,46 @@ def fmt_env(e):
             f"commit `{e['commit']}`, {e['time_utc']}")
 
 
+def best_r(x):
+    return min((1, 2, 4), key=lambda r: x[f"v4_r{r}"]["us"])
+
+
 def a1(r):
+    bw, w = r["bandwidth"], r["worst_rel_err"]
     out = ["## A1: kernels", "", f"Environment: {fmt_env(r['env'])}", "",
-           f"Measured device-to-device copy bandwidth: **{r['copy_bandwidth_gbps']:.0f} GB/s** "
-           f"(spec {r['spec_bandwidth_gbps']:.0f} GB/s); `% of copy BW` uses the measured figure.", "",
-           "Correctness: every version against an fp64 reference on the same quantized weights, M = 1..8, all shapes "
-           f"plus odd-N tails. Worst max-abs error / RMS(output): v1 {r['worst_rel_err']['v1']:.2e}, "
-           f"v2 {r['worst_rel_err']['v2']:.2e}, v3 {r['worst_rel_err']['v3']:.2e}, "
-           f"cuBLAS FP16 {r['worst_rel_err']['cublas']:.2e}.", ""]
+           f"Measured DRAM bandwidth: **{bw['read_gbps']:.0f} GB/s read-only**, {bw['copy_gbps']:.0f} GB/s copy "
+           f"(spec {r['spec_bandwidth_gbps']:.0f} GB/s). Rooflines and `% of BW` use the read figure. Weights are "
+           "read cold on every call (copies cycled past the 4 MiB L2), as in a real decode step.", "",
+           "Correctness: every kernel against an fp64 reference on the same quantized weights, M = 1..8, all shapes "
+           "plus odd-N tails. Worst max-abs error / RMS(output): " +
+           ", ".join(f"{k} {v:.2e}" for k, v in w.items() if not k.startswith("v4_")) + ".", ""]
     b = r["bench"]
     out += ["### Decode (M = 1): median latency, microseconds", "",
-            "| layer | K x N | FP16 cuBLAS | dequant + cuBLAS | v1 | v2 | v3 | v3 speedup vs FP16 | v3 % of copy BW |",
-            "|---|---|---|---|---|---|---|---|---|"]
+            "| layer | K x N | FP16 cuBLAS | FP16 roofline | dequant + cuBLAS | v1 | v2 | v3 | v4 (R) | INT4 roofline | "
+            "v4 vs FP16 cuBLAS | v4 vs FP16 roofline | v4 % of BW |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for x in b:
         if x["M"] != 1:
             continue
-        out.append(f"| {x['shape']} | {x['K']} x {x['N']} | {x['fp16_cublas']['us']:.1f} | {x['dequant_cublas']['us']:.1f} | "
-                   f"{x['v1']['us']:.1f} | {x['v2']['us']:.1f} | {x['v3']['us']:.1f} | "
-                   f"{x['fp16_cublas']['us'] / x['v3']['us']:.2f}x | {x['v3']['pct_peak']:.0f}% |")
-    out += ["", "### Small batch (M = 1, 2, 4, 8): v3 vs FP16 cuBLAS, microseconds", "",
+        out.append(f"| {x['shape']} | {x['K']} x {x['N']} | {x['fp16_cublas']['us']:.1f} | {x['fp16_roofline_us']:.1f} | "
+                   f"{x['dequant_cublas']['us']:.1f} | {x['v1']['us']:.1f} | {x['v2']['us']:.1f} | {x['v3']['us']:.1f} | "
+                   f"{x['v4']['us']:.1f} ({best_r(x)}) | {x['int4_roofline_us']:.1f} | "
+                   f"{x['fp16_cublas']['us'] / x['v4']['us']:.2f}x | {x['fp16_roofline_us'] / x['v4']['us']:.2f}x | "
+                   f"{x['v4']['pct_peak']:.0f}% |")
+    out += ["", "(R) = the fastest rows-per-warp among the v4_r1/r2/r4 runs; `v4` itself uses the R picked from N.", "",
+            "### Small batch: v4 / v3 / FP16 cuBLAS, microseconds", "",
             "| layer | " + " | ".join(f"M={m}" for m in (1, 2, 4, 8)) + " |", "|---|---|---|---|---|"]
     for name in dict.fromkeys(x["shape"] for x in b):
         cells = []
         for m in (1, 2, 4, 8):
             x = next((y for y in b if y["shape"] == name and y["M"] == m), None)
-            cells.append(f"{x['v3']['us']:.1f} / {x['fp16_cublas']['us']:.1f}" if x else "-")
+            cells.append(f"{x['v4']['us']:.1f} / {x['v3']['us']:.1f} / {x['fp16_cublas']['us']:.1f}" if x else "-")
         out.append(f"| {name} | " + " | ".join(cells) + " |")
     pre = [x for x in b if x["M"] > 8]
     if pre:
-        out += ["", "### Prefill: dequant + cuBLAS overhead vs FP16 cuBLAS", "",
-                "| layer | " + " | ".join(f"M={m}" for m in sorted({x['M'] for x in pre})) + " |",
-                "|---" * (1 + len({x['M'] for x in pre})) + "|"]
+        ms = sorted({x["M"] for x in pre})
+        out += ["", "### Prefill: dequant + cuBLAS time / FP16 cuBLAS time", "",
+                "| layer | " + " | ".join(f"M={m}" for m in ms) + " |", "|---" * (1 + len(ms)) + "|"]
         for name in dict.fromkeys(x["shape"] for x in pre):
             row = sorted((x for x in pre if x["shape"] == name), key=lambda x: x["M"])
             out.append(f"| {name} | " + " | ".join(

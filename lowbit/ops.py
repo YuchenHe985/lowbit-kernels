@@ -37,10 +37,10 @@ class W4Weight:
         return self.packed.numel() + self.scales.numel() * 2
 
 
-def gemv(x, wq, version=3):
-    """x [M, K] fp16, M <= 8 -> [M, N] fp16."""
-    w = wq.packed_v3 if version == 3 else wq.packed
-    return ext().w4_gemv(x.contiguous(), w, wq.scales, wq.group, version)
+def gemv(x, wq, version=4, rows_per_warp=0):
+    """x [M, K] fp16, M <= 8 -> [M, N] fp16. rows_per_warp only applies to v4 (0 = chosen from N)."""
+    w = wq.packed_v3 if version >= 3 else wq.packed
+    return ext().w4_gemv(x.contiguous(), w, wq.scales, wq.group, version, rows_per_warp)
 
 
 def dequant(wq):

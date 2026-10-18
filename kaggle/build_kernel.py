@@ -44,7 +44,7 @@ pathlib.Path("memcheck.py").write_text(
     "    wq = ops.W4Weight.from_float(torch.randn(n, k))\\n"
     "    for m in (1, 3, 8):\\n"
     "        x = torch.randn(m, k).half().cuda()\\n"
-    "        [ops.gemv(x, wq, v) for v in (1, 2, 3)]\\n"
+    "        [ops.gemv(x, wq, v, r) for v, r in ((1, 0), (2, 0), (3, 0), (4, 1), (4, 2), (4, 4))]\\n"
     "        ops.linear(torch.randn(16, k).half().cuda(), wq)\\n"
     "torch.cuda.synchronize(); print('memcheck workload done')\\n")
 run([sys.executable, "-c", "from lowbit import ops; ops.ext()"])   # build once, outside the sanitizer

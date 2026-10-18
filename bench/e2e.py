@@ -85,10 +85,14 @@ def where_time_goes(tok, m, steps=32):
 
 
 @torch.inference_mode()
-def perplexity(tok, m, windows, ctx=1024):
+def wikitext_ids(tok):
     from datasets import load_dataset
-    text = "\n\n".join(load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"])
-    ids = tok(text, return_tensors="pt").input_ids[0]
+    text = "\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"])
+    return tok(text, return_tensors="pt").input_ids[0]
+
+
+@torch.inference_mode()
+def perplexity(ids, m, windows, ctx=1024):
     nll, n = 0.0, 0
     for i in range(windows):
         chunk = ids[i * ctx:(i + 1) * ctx].unsqueeze(0).cuda()
@@ -105,7 +109,7 @@ def measure(tok, m, label, a):
     s, toks = speed(tok, m, a.new_tokens)
     r = {"label": label, "weight_bytes": weight_bytes(m), **s, "peak_mem_bytes_decode": torch.cuda.max_memory_allocated()}
     r["profile"] = where_time_goes(tok, m)
-    r["wikitext2"] = perplexity(tok, m, a.ppl_windows)
+    r["wikitext2"] = perplexity(a.ppl_ids, m, a.ppl_windows)
     print(label, json.dumps({k: v for k, v in r.items() if k != "profile"}), flush=True)
     print(label, "profile", json.dumps(r["profile"]["share_pct"]), flush=True)
     return r, toks
@@ -119,6 +123,7 @@ def main():
     ap.add_argument("--ppl-windows", type=int, default=40)
     a = ap.parse_args()
     tok, m = load(a.model)
+    a.ppl_ids = wikitext_ids(tok)                       # first, so a dataset problem fails before any timing
     fp16, toks16 = measure(tok, m, "fp16", a)
     t = time.time()
     replaced, w4 = lbmodel.quantize_model(m)

@@ -29,6 +29,9 @@ SHAPES = [
 ]
 EDGE_SHAPES = [("tiny", 128, 1), ("odd_n", 256, 1001), ("odd_n2", 384, 37)]   # tails: N not a multiple of the 4 rows per block
 GROUP = 128
+# kernel variants: name -> (version, rows_per_warp); v4 picks R from N, the v4_r* rows show what each R would give
+KERNELS = {"v1": (1, 0), "v2": (2, 0), "v3": (3, 0), "v4": (4, 0), "v4_r1": (4, 1), "v4_r2": (4, 2), "v4_r4": (4, 4)}
+L2_FLUSH_BYTES = 64 << 20      # cycle through enough weight copies that each call reads cold from DRAM (T4 L2: 4 MiB)
 
 
 def env():
@@ -47,29 +50,52 @@ def env():
 
 
 def timed(fn, warmup=20, iters=100, rounds=5):
-    """Median, p10, p90 of per-call time in microseconds over `rounds` batches of `iters` calls."""
+    """Median, p10, p90 of per-call GPU time in microseconds over `rounds` replays of a CUDA graph holding `iters`
+    calls. The graph removes Python and launch overhead (several microseconds per call), which would otherwise hide
+    the kernel on small layers; fall back to plain launches if the call cannot be captured."""
     for _ in range(warmup):
         fn()
+    torch.cuda.synchronize()
+    try:
+        g = torch.cuda.CUDAGraph()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            fn()
+        torch.cuda.current_stream().wait_stream(s)
+        with torch.cuda.graph(g):
+            for _ in range(iters):
+                fn()
+        run, mode = g.replay, "cuda_graph"
+    except RuntimeError:
+        def run():
+            for _ in range(iters):
+                fn()
+        mode = "eager"
+    run()
     torch.cuda.synchronize()
     per = []
     for _ in range(rounds):
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         a.record()
-        for _ in range(iters):
-            fn()
+        run()
         b.record()
         b.synchronize()
         per.append(a.elapsed_time(b) * 1000 / iters)
     per.sort()
-    return {"us": float(np.median(per)), "p10": float(np.percentile(per, 10)), "p90": float(np.percentile(per, 90))}
+    return {"us": float(np.median(per)), "p10": float(np.percentile(per, 10)), "p90": float(np.percentile(per, 90)),
+            "timing": mode}
 
 
-def copy_bandwidth():
-    """Achievable DRAM bandwidth: a 256 MiB device-to-device copy reads and writes every byte once."""
+def bandwidth():
+    """Achievable DRAM bandwidth, two ways: a 256 MiB device-to-device copy (read + write every byte) and a
+    256 MiB read-only reduction. A GEMV mostly reads, so the read figure is its ceiling."""
     src = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
     dst = torch.empty_like(src)
     t = timed(lambda: dst.copy_(src), warmup=5, iters=20, rounds=5)
-    return 2 * src.numel() / (t["us"] * 1e-6) / 1e9
+    f = src.view(torch.float32).normal_()
+    r = timed(lambda: f.sum(), warmup=5, iters=20, rounds=5)
+    return {"copy_gbps": 2 * src.numel() / (t["us"] * 1e-6) / 1e9, "read_gbps": src.numel() / (r["us"] * 1e-6) / 1e9}
 
 
 def check(shapes, rows):
@@ -96,30 +122,37 @@ def check(shapes, rows):
                    "dequant_max_abs_err": dq_err}
             # v3 keeps fp16 partials over 8 products (HFMA2), so it may sit a few times above cuBLAS's fp32
             # accumulation; a layout or indexing bug gives O(1) relative error, far beyond this bound
-            for v in (1, 2, 3):
-                e = (ops.gemv(x, wq, v).double() - ref).abs().max().item() / scale
-                row[f"v{v}_rel"] = e
+            for kname, (v, rpw) in KERNELS.items():
+                e = (ops.gemv(x, wq, v, rpw).double() - ref).abs().max().item() / scale
+                row[f"{kname}_rel"] = e
                 ok &= e <= max(4 * cublas, 4 * floor, 3e-3)
             out.append(row)
     return ok, out
 
 
 def bench(shapes, rows_decode, rows_prefill, peak):
+    """Every call reads its weights cold: enough copies of the layer are cycled that they overflow L2, as in a
+    real decode step, where the other layers' weights evict this one between uses."""
     res = []
     for name, k, n in shapes:
-        wq = ops.W4Weight.from_float(torch.randn(n, k), GROUP)
-        w16 = ops.dequant(wq)
+        copies = max(1, -(-L2_FLUSH_BYTES // (n * k * 2)))
+        wqs = [ops.W4Weight.from_float(torch.randn(n, k), GROUP) for _ in range(copies)]
+        w16s = [ops.dequant(wq) for wq in wqs]
+        nxt = iter(range(1 << 62))
+        pick = lambda seq: seq[next(nxt) % copies]
         for m in sorted(set(rows_decode) | set(rows_prefill)):
             x = torch.randn(m, k).half().cuda()
-            r = {"shape": name, "K": k, "N": n, "M": m}
+            r = {"shape": name, "K": k, "N": n, "M": m, "weight_copies": copies}
             act = 2 * (m * k + m * n)
-            w4_bytes, w16_bytes = wq.nbytes(), n * k * 2
-            r["fp16_cublas"] = timed(lambda: torch.nn.functional.linear(x, w16))
-            r["dequant_cublas"] = timed(lambda: torch.nn.functional.linear(x, ops.dequant(wq)))
-            r["dequant_only"] = timed(lambda: ops.dequant(wq))
+            w4_bytes, w16_bytes = wqs[0].nbytes(), n * k * 2
+            r["fp16_roofline_us"] = (w16_bytes + act) / (peak * 1e9) * 1e6
+            r["int4_roofline_us"] = (w4_bytes + act) / (peak * 1e9) * 1e6
+            r["fp16_cublas"] = timed(lambda: torch.nn.functional.linear(x, pick(w16s)))
+            r["dequant_cublas"] = timed(lambda: torch.nn.functional.linear(x, ops.dequant(pick(wqs))))
+            r["dequant_only"] = timed(lambda: ops.dequant(pick(wqs)))
             if m <= 8:
-                for v in (1, 2, 3):
-                    r[f"v{v}"] = timed(lambda v=v: ops.gemv(x, wq, v))
+                for kname, (v, rpw) in KERNELS.items():
+                    r[kname] = timed(lambda v=v, rpw=rpw: ops.gemv(x, pick(wqs), v, rpw))
             for key in [kk for kk in r if isinstance(r[kk], dict)]:
                 moved = (w16_bytes if key == "fp16_cublas" else w4_bytes) + act
                 if key == "dequant_cublas":
@@ -131,30 +164,33 @@ def bench(shapes, rows_decode, rows_prefill, peak):
             res.append(r)
             print(f"{name:18s} M={m:<4d} " + "  ".join(f"{kk}={r[kk]['us']:.1f}us" for kk in r if isinstance(r[kk], dict)),
                   flush=True)
+        wqs = w16s = None
+        torch.cuda.empty_cache()
     return res
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="results/a1.json")
-    ap.add_argument("--quick", action="store_true", help="two shapes, for a smoke run")
+    ap.add_argument("--quick", action="store_true", help="four shapes (small, wide, long-K, 7B-class), decode only")
     a = ap.parse_args()
     torch.manual_seed(0)
-    shapes = SHAPES[:2] if a.quick else SHAPES
+    shapes = [SHAPES[i] for i in (0, 5, 9, 10)] if a.quick else SHAPES
     t0 = time.time()
     ops.ext()
     build_s = time.time() - t0
     ok, checks = check(shapes + EDGE_SHAPES, range(1, 9))
-    worst = {f"v{v}": max(c[f"v{v}_rel"] for c in checks) for v in (1, 2, 3)}
+    worst = {kname: max(c[f"{kname}_rel"] for c in checks) for kname in KERNELS}
     worst["cublas"] = max(c["cublas_rel"] for c in checks)
     print("correctness", "PASS" if ok else "FAIL", worst, flush=True)
     result = {"env": env(), "build_seconds": build_s, "group": GROUP, "correct": ok, "worst_rel_err": worst,
               "checks": checks}
     if ok:
-        peak = copy_bandwidth()
-        result["copy_bandwidth_gbps"] = peak
+        bw = bandwidth()
+        peak = bw["read_gbps"]
+        result["bandwidth"] = bw
         result["spec_bandwidth_gbps"] = 320.0 if "T4" in result["env"]["gpu"] else None
-        print(f"device-to-device copy bandwidth {peak:.1f} GB/s", flush=True)
+        print(f"bandwidth {bw}", flush=True)
         result["bench"] = bench(shapes, [1, 2, 4, 8], [] if a.quick else [16, 32, 64, 128, 256, 512, 1024], peak)
     pathlib.Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(a.out).write_text(json.dumps(result, indent=1))
