@@ -2,6 +2,7 @@
 import numpy as np
 import pytest
 
+from lowbit import quant
 from lowbit.quant import (dequantize_w4, gemv_reference, interleave_for_gpu, quantize_w4, unpack_w4)
 
 RNG = np.random.default_rng(0)
@@ -90,3 +91,28 @@ def test_reference_gemv():
     y = gemv_reference(x, packed, scales, 128)
     assert y.shape == (3, 16)
     assert np.allclose(y, x @ dequantize_w4(packed, scales, 128).T, rtol=1e-5, atol=1e-4)
+
+
+def test_mma_layout_feeds_each_lane_its_fragment():
+    """Simulate what lane t of an mma quad decodes from the v5 layout and compare with the canonical values."""
+    rng = np.random.default_rng(5)
+    packed, _ = quant.quantize_w4(rng.standard_normal((3, 384)).astype(np.float32))
+    u = quant.unpack_w4(packed) + quant.OFFSET
+    mma = quant.interleave_for_mma(packed)
+    words = mma.reshape(3, -1, 4, 4, 4).view("<u4")[..., 0]          # [row, chunk, lane t, word]
+    for c in range(384 // 128):
+        for t in range(4):
+            for s in range(16):
+                w, j = int(words[1, c, t, s >> 2]), s & 3
+                k = 128 * c + 8 * s + 2 * t
+                assert (w >> (4 * j)) & 0xF == u[1, k] and (w >> (4 * j + 16)) & 0xF == u[1, k + 1]
+
+
+def test_mma_layout_is_a_permutation_and_rejects_bad_k():
+    rng = np.random.default_rng(6)
+    packed, _ = quant.quantize_w4(rng.standard_normal((2, 256)).astype(np.float32))
+    a = quant.unpack_w4(packed)
+    b = quant.unpack_w4(quant.interleave_for_mma(packed))
+    assert sorted(a[0].tolist()) == sorted(b[0].tolist())
+    with pytest.raises(ValueError):
+        quant.interleave_for_mma(np.zeros((1, 32), np.uint8))

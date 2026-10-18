@@ -10,6 +10,10 @@ Layout, for an nn.Linear weight W of shape [N, K] (out_features x in_features):
 The GPU kernel v3 reads a reordered copy (interleave_for_gpu) in which every 32-bit word holds
 k0..k7 at nibble positions [k0, k2, k4, k6, k1, k3, k5, k7], so that one mask + OR turns a word into
 fp16 pairs (k0,k1), (k2,k3), ... that line up with consecutive activations. Same values, same bytes.
+
+The tensor-core kernel v5 reads interleave_for_mma: inside every 128-value chunk of a row (64 bytes) the bytes are
+regrouped so that lane t of an mma.m16n8k8 quad finds, in one 16-byte load, the 16 byte-pairs it feeds to the
+A fragment (k = 8s + 2t, 8s + 2t + 1 for s = 0..15), and then the v3 nibble order is applied to every word.
 """
 import numpy as np
 
@@ -58,6 +62,20 @@ def interleave_for_gpu(packed):
     words = u.reshape(n, k // 8, 8)[:, :, SLOT_TO_K]           # slot order inside every 8-value word
     words = words.reshape(n, k).astype(np.uint8)
     return words[:, 0::2] | (words[:, 1::2] << 4)
+
+
+# byte position 16t + s of a 64-byte chunk holds canonical byte 4s + t (k = 8s + 2t, 8s + 2t + 1)
+MMA_BYTE_ORDER = np.array([4 * s + t for t in range(4) for s in range(16)])
+
+
+def interleave_for_mma(packed):
+    """Canonical packed [N, K//2] -> the v5 layout (see module doc). K must be a multiple of 128."""
+    packed = np.asarray(packed, dtype=np.uint8)
+    n, half_k = packed.shape
+    if half_k % 64:
+        raise ValueError(f"K={2 * half_k} must be a multiple of 128 for the tensor-core layout")
+    regrouped = packed.reshape(n, half_k // 64, 64)[:, :, MMA_BYTE_ORDER].reshape(n, half_k)
+    return interleave_for_gpu(regrouped)
 
 
 def gemv_reference(x, packed, scales, group=128):

@@ -30,7 +30,9 @@ SHAPES = [
 EDGE_SHAPES = [("tiny", 128, 1), ("odd_n", 256, 1001), ("odd_n2", 384, 37)]   # tails: N not a multiple of the 4 rows per block
 GROUP = 128
 # kernel variants: name -> (version, rows_per_warp); v4 picks R from N, the v4_r* rows show what each R would give
-KERNELS = {"v1": (1, 0), "v2": (2, 0), "v3": (3, 0), "v4": (4, 0), "v4_r1": (4, 1), "v4_r2": (4, 2), "v4_r4": (4, 4)}
+KERNELS = {"v1": (1, 0), "v2": (2, 0), "v3": (3, 0), "v4": (4, 0), "v4_r1": (4, 1), "v4_r2": (4, 2), "v4_r4": (4, 4),
+           "v5": (5, 0), "v5_t1": (5, 1), "v5_t2": (5, 2), "v5_t4": (5, 4), "v6": (6, 0)}      # v5_tN: N 16-row tiles per warp
+TC_ROWS = (12, 16, 33, 64)     # beyond the GEMV range: only the tensor-core kernel (v5) takes these
 L2_FLUSH_BYTES = 64 << 20      # cycle through enough weight copies that each call reads cold from DRAM (T4 L2: 4 MiB)
 
 
@@ -104,13 +106,28 @@ def check(shapes, rows):
     out, ok = [], True
     for name, k, n in shapes:
         g = torch.Generator(device="cpu").manual_seed(k * 7 + n)
-        wq = ops.W4Weight.from_float(torch.randn(n, k, generator=g), GROUP)
+        wf = torch.randn(n, k, generator=g)
+        wq = ops.W4Weight.from_float(wf, GROUP)
+        # the GPU quantizer (used for whole models) must give the golden model's bits
+        pk, sc = ops.quantize_w4_gpu(wf.cuda(), GROUP)
+        same = {"gpu_quant": bool(torch.equal(pk, wq.packed) and torch.equal(sc, wq.scales)),
+                "gpu_dequant": bool(torch.equal(ops.dequantize_w4_gpu(pk, sc, GROUP), ops.dequant(wq)))}
+        for key in ("gpu_quant", "gpu_dequant"):
+            if not same[key]:
+                print(f"MISMATCH {key} on {name}", flush=True)
+                ok = False
         w16 = ops.dequant(wq)
         ref_w = torch.from_numpy(quant.dequantize_w4(wq.packed.cpu().numpy(), wq.scales.cpu().numpy(), GROUP)).double().cuda()
         dq_err = (w16.double() - ref_w).abs().max().item()
         # q * scale is exact in fp32; the kernel rounds it to fp16 once (round to nearest), so it must equal the
         # fp64 reference rounded to fp16 bit for bit
-        ok &= bool(torch.equal(w16, ref_w.half()))
+        if not torch.equal(w16, ref_w.half()):
+            print(f"MISMATCH dequant_kernel on {name}", flush=True)
+            ok = False
+        # the model keeps only the v5 layout; its dequantize kernel must give the same fp16 weights
+        if not torch.equal(ops.ext().w4_dequant(wq.packed_mma, wq.scales, GROUP, True), w16):
+            print(f"MISMATCH dequant_mma_kernel on {name}", flush=True)
+            ok = False
         for m in rows:
             x = torch.randn(m, k, generator=g).half().cuda()
             ref = x.double() @ ref_w.T
@@ -123,6 +140,8 @@ def check(shapes, rows):
             # v3 keeps fp16 partials over 8 products (HFMA2), so it may sit a few times above cuBLAS's fp32
             # accumulation; a layout or indexing bug gives O(1) relative error, far beyond this bound
             for kname, (v, rpw) in KERNELS.items():
+                if m > 8 and v != 5:                      # v5 alone goes past 8 rows
+                    continue
                 e = (ops.gemv(x, wq, v, rpw).double() - ref).abs().max().item() / scale
                 row[f"{kname}_rel"] = e
                 ok &= e <= max(4 * cublas, 4 * floor, 3e-3)
@@ -150,8 +169,8 @@ def bench(shapes, rows_decode, rows_prefill, peak):
             r["fp16_cublas"] = timed(lambda: torch.nn.functional.linear(x, pick(w16s)))
             r["dequant_cublas"] = timed(lambda: torch.nn.functional.linear(x, ops.dequant(pick(wqs))))
             r["dequant_only"] = timed(lambda: ops.dequant(pick(wqs)))
-            if m <= 8:
-                for kname, (v, rpw) in KERNELS.items():
+            for kname, (v, rpw) in KERNELS.items():
+                if m <= 8 or (v == 5 and m <= 64):
                     r[kname] = timed(lambda v=v, rpw=rpw: ops.gemv(x, pick(wqs), v, rpw))
             for key in [kk for kk in r if isinstance(r[kk], dict)]:
                 moved = (w16_bytes if key == "fp16_cublas" else w4_bytes) + act
@@ -179,8 +198,8 @@ def main():
     t0 = time.time()
     ops.ext()
     build_s = time.time() - t0
-    ok, checks = check(shapes + EDGE_SHAPES, range(1, 9))
-    worst = {kname: max(c[f"{kname}_rel"] for c in checks) for kname in KERNELS}
+    ok, checks = check(shapes + EDGE_SHAPES, list(range(1, 9)) + list(TC_ROWS))
+    worst = {kname: max(c[f"{kname}_rel"] for c in checks if f"{kname}_rel" in c) for kname in KERNELS}
     worst["cublas"] = max(c["cublas_rel"] for c in checks)
     print("correctness", "PASS" if ok else "FAIL", worst, flush=True)
     result = {"env": env(), "build_seconds": build_s, "group": GROUP, "correct": ok, "worst_rel_err": worst,
@@ -191,7 +210,7 @@ def main():
         result["bandwidth"] = bw
         result["spec_bandwidth_gbps"] = 320.0 if "T4" in result["env"]["gpu"] else None
         print(f"bandwidth {bw}", flush=True)
-        result["bench"] = bench(shapes, [1, 2, 4, 8], [] if a.quick else [16, 32, 64, 128, 256, 512, 1024], peak)
+        result["bench"] = bench(shapes, [1, 2, 4, 8], [16, 32, 64] if a.quick else [16, 32, 64, 128, 256, 512, 1024], peak)
     pathlib.Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(a.out).write_text(json.dumps(result, indent=1))
     sys.exit(0 if ok else 1)

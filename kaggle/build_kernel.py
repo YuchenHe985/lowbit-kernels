@@ -44,8 +44,10 @@ pathlib.Path("memcheck.py").write_text(
     "    wq = ops.W4Weight.from_float(torch.randn(n, k))\\n"
     "    for m in (1, 3, 8):\\n"
     "        x = torch.randn(m, k).half().cuda()\\n"
-    "        [ops.gemv(x, wq, v, r) for v, r in ((1, 0), (2, 0), (3, 0), (4, 1), (4, 2), (4, 4))]\\n"
+    "        [ops.gemv(x, wq, v, r) for v, r in ((1, 0), (2, 0), (3, 0), (4, 1), (4, 2), (4, 4), (5, 0), (5, 1), (5, 2), (5, 4), (6, 1), (6, 2), (6, 4))]\\n"
+    "        [ops.gemv(torch.randn(40, k).half().cuda(), wq, 5, r) for r in (1, 2)]\\n"
     "        ops.linear(torch.randn(16, k).half().cuda(), wq)\\n"
+    "        ops.linear(torch.randn(80, k).half().cuda(), ops.W4Weight(*ops.quant.quantize_w4(torch.randn(n, k).numpy()), 128, ('mma',)))\\n"
     "torch.cuda.synchronize(); print('memcheck workload done')\\n")
 run([sys.executable, "-c", "from lowbit import ops; ops.ext()"])   # build once, outside the sanitizer
 san = "/usr/local/cuda/bin/compute-sanitizer"
@@ -65,8 +67,9 @@ else:
     print("compute-sanitizer not found in this image", flush=True)
 if MODE == "e2e":
     for size in ("0.5B", "1.5B", "3B"):
-        run([sys.executable, "bench/e2e.py", "--model", f"Qwen/Qwen2.5-{{size}}-Instruct",
-             "--out", f"results/e2e_{{size.lower()}}.json"], check=False)
+        for clip in ([], ["--clip"]):                       # absmax scales, then the per-group clipping search
+            run([sys.executable, "bench/e2e.py", "--model", f"Qwen/Qwen2.5-{{size}}-Instruct",
+                 "--out", f"results/e2e_{{size.lower()}}{{'_clip' if clip else ''}}.json"] + clip, check=False)
 else:
     run([sys.executable, "bench/gpu_run.py", "--out", "results/a1.json"] + (["--quick"] if MODE == "quick" else []))
 subprocess.run(["cp", "-r", "results", "/kaggle/working/"])
