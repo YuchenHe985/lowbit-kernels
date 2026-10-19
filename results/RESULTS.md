@@ -71,6 +71,25 @@ Each cell: fastest variant time (which) / FP16 cuBLAS time, microseconds. v5_tN 
 | 7b-class.gate_up | 172.8 (v4_r4) / 819.3 | 225.1 (v5_t4) / 586.2 | 241.5 (v5_t4) / 595.8 | 289.3 (v5_t4) / 633.7 | 408.4 (v5_t4) / 706.3 | 564.0 (v5_t4) / 873.9 | 1209.8 (v5_t4) / 909.3 |
 | 7b-class.down | 170.3 (v4) / 735.2 | 232.5 (v5_t2) / 585.6 | 270.7 (v5_t4) / 596.7 | 305.1 (v5_t4) / 637.8 | 420.1 (v5_t4) / 694.9 | 573.7 (v5_t4) / 858.7 | 1250.5 (v5) / 955.1 |
 
+### The auto rule's own comparison: `linear()` / dequantize + cuBLAS (both on the mma-only copy)
+
+The rule picks v5 where it beats the path a model would otherwise take; 1.00x = the rule picked dequantize + cuBLAS itself.
+
+| layer | N | M=2 | M=4 | M=8 | M=16 | M=32 | M=64 |
+|---|---|---|---|---|---|---|---|
+| qwen0.5b.q_proj | 896 | 0.36x (v5) | 0.40x (v5) | 0.45x (v5) | 0.58x (v5) | 0.81x (v5) | 1.08x (dq) |
+| qwen0.5b.kv_proj | 128 | 0.51x (v5) | 0.70x (v5) | 0.58x (v5) | 0.73x (v5) | 0.81x (v5) | 1.00x (dq) |
+| qwen0.5b.gate_up | 4864 | 0.16x (v5) | 0.18x (v5) | 0.22x (v5) | 0.33x (v5) | 0.54x (v5) | 0.90x (v5) |
+| qwen0.5b.down | 896 | 0.27x (v5) | 0.29x (v5) | 0.36x (v5) | 0.57x (v5) | 0.82x (v5) | 0.99x (dq) |
+| qwen1.5b.q_proj | 1536 | 0.27x (v5) | 0.31x (v5) | 0.40x (v5) | 0.59x (v5) | 0.76x (v5) | 0.89x (dq) |
+| qwen1.5b.gate_up | 8960 | 0.14x (v5) | 0.18x (v5) | 0.18x (v5) | 0.22x (v5) | 0.35x (v5) | 0.75x (v5) |
+| qwen1.5b.down | 1536 | 0.19x (v5) | 0.23x (v5) | 0.33x (v5) | 0.48x (v5) | 0.72x (v5) | 1.00x (dq) |
+| qwen3b.q_proj | 2048 | 0.16x (v5) | 0.22x (v5) | 0.27x (v5) | 0.54x (v5) | 0.78x (v5) | 0.97x (dq) |
+| qwen3b.gate_up | 11008 | 0.15x (v5) | 0.20x (v5) | 0.20x (v5) | 0.24x (v5) | 0.34x (v5) | 0.71x (v5) |
+| qwen3b.down | 2048 | 0.18x (v5) | 0.22x (v5) | 0.29x (v5) | 0.42x (v5) | 0.72x (v5) | 1.01x (dq) |
+| 7b-class.gate_up | 18944 | 0.21x (v5) | 0.24x (v5) | 0.20x (v5) | 0.29x (v5) | 0.36x (v5) | 0.77x (v5) |
+| 7b-class.down | 3584 | 0.21x (v5) | 0.25x (v5) | 0.25x (v5) | 0.34x (v5) | 0.47x (v5) | 0.75x (v5) |
+
 ### Prefill (M > 64): dequantize (model's mma copy) + cuBLAS / FP16 cuBLAS; canonical-copy dequantize in parentheses; 64-row v5 slices in brackets
 
 | layer | M=65 | M=96 | M=128 | M=192 | M=256 | M=384 | M=512 | M=1024 |
@@ -87,6 +106,17 @@ Each cell: fastest variant time (which) / FP16 cuBLAS time, microseconds. v5_tN 
 | qwen3b.down | 1.64x (1.57x) [2.23x] | 1.67x (1.64x) [2.93x] | 1.51x (1.49x) [3.28x] | 1.39x (1.36x) [3.39x] | 1.25x (1.24x) [3.44x] | 1.23x (1.22x) [4.34x] | 1.15x (1.14x) [3.76x] | 1.09x (1.09x) |
 | 7b-class.gate_up | 1.66x (1.60x) [1.37x] | 1.58x (1.54x) [1.53x] | 1.54x (1.49x) [1.98x] | 1.36x (1.34x) [1.95x] | 1.37x (1.33x) [2.47x] | 1.25x (1.23x) [2.63x] | 1.17x (1.16x) [2.44x] | 1.11x (1.11x) |
 | 7b-class.down | 1.65x (1.61x) [1.37x] | 1.59x (1.54x) [1.67x] | 1.53x (1.48x) [1.93x] | 1.41x (1.38x) [2.05x] | 1.29x (1.29x) [2.03x] | 1.25x (1.23x) [2.55x] | 1.19x (1.18x) [2.66x] | 1.11x (1.10x) |
+
+### compute-sanitizer (every kernel on small shapes incl. odd-N tails, M = 1/3/8, plus `linear()` at 16 and 80 rows)
+
+| pass | summary | first finding |
+|---|---|---|
+| memcheck_all | ERROR SUMMARY: 1 error | Program hit CUDA_ERROR_INVALID_HANDLE (error 400) due to "invalid resource handle" on CUDA API call to cuKernelGetFunction. |
+| memcheck_memory_only | ERROR SUMMARY: 0 errors |  |
+| racecheck | RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |  |
+| synccheck | ERROR SUMMARY: 0 errors |  |
+
+All passes ran with CUDA_MODULE_LOADING=EAGER; memcheck_memory_only reports memory-access errors alone (API errors off).
 
 ### DRAM counters (Nsight Compute)
 

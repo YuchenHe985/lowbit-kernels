@@ -1,6 +1,6 @@
 """Render the measured results as Markdown tables (the README's numbers come only from here).
 
-    python bench/report.py results/raw/a1.json [results/raw/e2e_*.json] [results/raw/ncu_dram.csv] > results/RESULTS.md
+    python bench/report.py results/raw/a1.json [results/raw/*.txt] [results/raw/ncu_dram.csv] [results/raw/e2e_*.json] > results/RESULTS.md
 """
 import csv
 import io
@@ -114,6 +114,17 @@ def a1(r):
             k, us = best_variant(x)
             cells.append(f"{us:.1f} ({k}) / {x['fp16_cublas']['us']:.1f}")
         out.append(f"| {name} | " + " | ".join(cells) + " |")
+    small = [m for m in ms if 1 < m <= 64]
+    out += ["", "### The auto rule's own comparison: `linear()` / dequantize + cuBLAS (both on the mma-only copy)", "",
+            "The rule picks v5 where it beats the path a model would otherwise take; 1.00x = the rule picked "
+            "dequantize + cuBLAS itself.", "",
+            "| layer | N | " + " | ".join(f"M={m}" for m in small) + " |", "|---" * (2 + len(small)) + "|"]
+    for name in dict.fromkeys(x["shape"] for x in b):
+        row = {y["M"]: y for y in b if y["shape"] == name}
+        n = next(iter(row.values()))["N"]
+        out.append(f"| {name} | {n} | " + " | ".join(
+            f"{row[m]['linear']['us'] / row[m]['dequant_cublas']['us']:.2f}x ({short[row[m]['linear_path']]})"
+            if m in row else "-" for m in small) + " |")
     pre = [x for x in b if x["M"] > 64]
     if pre:
         pm = sorted({x["M"] for x in pre})
@@ -226,17 +237,37 @@ def scales(r):
     return "clip search" if r.get("clip_search") else "absmax"
 
 
+def sanitizer(paths):
+    """compute-sanitizer outcomes, quoted from each tool's own summary line."""
+    out = ["", "### compute-sanitizer (every kernel on small shapes incl. odd-N tails, M = 1/3/8, plus `linear()` "
+           "at 16 and 80 rows)", "", "| pass | summary | first finding |", "|---|---|---|"]
+    for p in sorted(paths):
+        text = open(p).read()
+        summ = next((ln.replace("=========", "").strip() for ln in text.splitlines() if "SUMMARY" in ln), "no summary")
+        first = next((ln.replace("=========", "").strip() for ln in text.splitlines()
+                      if "Program hit" in ln or "Invalid" in ln or "Race" in ln), "")
+        tag = p.split("/")[-1].removesuffix(".txt")
+        out.append(f"| {tag} | {summ} | {first[:160]} |")
+    return out + ["", "All passes ran with CUDA_MODULE_LOADING=EAGER; memcheck_memory_only reports memory-access "
+                  "errors alone (API errors off)."]
+
+
 def main():
-    lines, e, csvs = [], [], []
+    lines, e, csvs, san = [], [], [], []
     for p in sys.argv[1:]:
         if p.endswith(".csv"):
             csvs.append(open(p).read())
+            continue
+        if p.endswith(".txt"):
+            san.append(p)
             continue
         d = json.load(open(p))
         if "bench" in d:
             lines += a1(d)
         elif "fake_quant" in d:
             e.append(d)
+    if san:
+        lines += sanitizer(san)
     for c in csvs:
         lines += ncu(c)
     if e:

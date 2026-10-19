@@ -11,16 +11,18 @@ renders from the raw JSON of the runs (GPU, driver, CUDA, torch, commit and a ha
 
 ## Results (Tesla T4, sm_75)
 
-**Kernels (A1).** At batch 1 on the MLP layers, which hold most of the weights, the INT4 GEMV (v4)
-takes **0.34-0.69x the time an FP16 kernel needs just to read its weights** at the measured 273 GB/s,
-so no FP16 kernel could match it. It reaches up to **75%** of that bandwidth. The GEMV a model
-actually runs (v6, on the one weight layout the model keeps) takes 0.43-0.74x. Against FP16 cuBLAS
-the deployed path is 1.4-3.8x faster at batch 1, but cuBLAS itself reaches only 10-87% of bandwidth
-there, so the roofline comparison is the fairer one. Every kernel is checked against an fp64
-reference on the same quantized weights (worst error 2.5e-3 of output RMS, below cuBLAS's own
-3.4e-3). compute-sanitizer finds no memory-access errors, shared-memory races or barrier misuse;
-its full memcheck pass reports one CUDA API error (an invalid handle when the runtime first looks up
-a kernel), which persists with eager module loading and is its only finding.
+**Kernels (A1).** At batch 1 on the MLP layers, which hold most of the weights, the standalone INT4
+GEMV (v4) takes **0.34-0.69x the time an FP16 kernel would need just to stream its weights once** at
+the measured 273 GB/s. Every call reads cold weights: operands cycle through at least 64 MiB of copies
+against the T4's 4 MiB L2. v4 reaches up to **75%** of that bandwidth. The GEMV a model actually runs
+(v6, on the one weight layout the model keeps) takes 0.43-0.74x. Against FP16 cuBLAS the deployed
+path is 1.4-3.8x faster at batch 1, but cuBLAS itself reaches only 10-87% of bandwidth there, so the
+bandwidth comparison is the fairer one. Every kernel is checked against an fp64 reference on the
+same quantized weights: worst normalized errors are 2.06-2.53e-3 (cuBLAS's independent worst on the
+same cases: 3.43e-3), 2.61e-3 across every boundary of the dispatch rule, and an overflow regression
+is exact. compute-sanitizer finds no memory-access errors, shared-memory races or barrier misuse. Its
+full memcheck pass reports one CUDA API error, an invalid handle on `cuKernelGetFunction`, which is
+its only finding.
 
 **End to end (A2), batch 1, greedy decoding, WikiText-2 perplexity:**
 
@@ -30,37 +32,45 @@ a kernel), which persists with eager module loading and is its only finding.
 | Qwen2.5-1.5B | 2.88 -> 1.06 GiB | 50.7 -> 85.9 tok/s (1.69x) | 4.65 -> 2.76 GB | 10.65 -> 12.39 |
 | Qwen2.5-3B | 5.75 -> 1.91 GiB | 28.7 -> 57.6 tok/s (2.01x) | 7.85 -> 3.64 GB | 9.56 -> 10.83 |
 
-* **Kernel error is separated from quantization error.** A "fake-quant" model holds exactly the
-  dequantized INT4 weights in ordinary FP16 layers. Its perplexity matches the INT4 model to within
-  0.002. Feeding the same 512 tokens through the KV cache at 1, 16 and 48 tokens per step (each
-  decode kernel in turn), INT4 and fake-quant pick the same next token 99.2-100% of the time. The
-  quality loss is the cost of 4-bit weights, not of the kernels.
+Models are the Qwen2.5-Instruct checkpoints. INT4 weights total 2.1-3.0x smaller than FP16 rather than
+4x, because the embeddings (tied to the output head) stay FP16 and every group of 128 weights carries
+an FP16 scale. Only the decoder projections are quantized.
+
+* **4-bit weights cost real quality, and the kernels add almost none.** With the clip search,
+  perplexity rises 39% at 0.5B, 16% at 1.5B and 13% at 3B, and the INT4 model picks the same next
+  token as FP16 71-80% of the time. A "fake-quant" model holds exactly the dequantized INT4 weights in
+  ordinary FP16 layers, which separates the cost of the weights from the cost of the kernels. On the
+  perplexity run it matches INT4 to within 0.002. Fed the same 512 tokens through the KV cache at 1, 16
+  and 48 tokens per step (each decode kernel in turn), INT4 and fake-quant agree on the next token
+  99.2-100% of the time, with perplexity within 0.011 and a worst logit gap of 11% of RMS.
 * **The per-group clip search matters.** Plain absmax scales take 3B from 9.56 to 15.20 perplexity.
   Searching a clipping factor per group of 128 weights brings it to 10.83, at no runtime cost.
 * **The gain grows with model size.** A CUDA-graph step at 0.5B spends only 30% of its GPU time in
   the INT4 linear kernels (attention, norms and elementwise work make up the rest), so faster
-  kernels move the step less. At 3B the FP16 step is GPU-bound (its graph step is 87% of the eager
-  step) and dominated by reading weights, so halving that time doubles the speed.
-* **The CUDA graph does not change the output.** Fed the same tokens, the graph and eager runs pick
-  the same next token at 99.2-100% of 128 positions; the worst logit gap is 7.8% of RMS.
+  kernels move the step less. At 3B the FP16 graph step is 87% as long as the eager step, which is
+  consistent with a step made mostly of GPU work; the INT4 step there is half as long.
+* **Graph and eager runs agree closely.** Fed the same tokens, they pick the same next token at
+  99.2-100% of 128 positions, and the worst logit gap is 7.8% of RMS.
 
 ## Where it does not pay (measured, not hidden)
 
 * **Eager decode is slower (0.84-0.85x).** Without CUDA graphs, decode at these sizes is bound by
-  CPU kernel launches: the INT4 graph step is only 21-37% as long as the eager step, so the rest is
-  CPU time, and the INT4 layer's extra per-call CPU work outweighs its shorter GEMVs. With each
-  decode step replayed as one CUDA graph, the kernel gain shows through.
+  host-side overhead: the INT4 graph step is only 21-37% as long as the eager step, and the INT4
+  eager step is longer than FP16's, even though its GPU work is shorter. With each decode step
+  replayed as one CUDA graph, the kernel gain shows through.
 * **Prefill and time to first token.** For many rows, the kernels lose to cuBLAS tensor-core GEMMs,
   so prefill dequantizes each layer to FP16 and calls cuBLAS. That costs up to 1.75x the FP16 GEMM
   time (about 1.1x at 1024 rows), and TTFT for a 65-token prompt rises from 35-55 ms to 48-91 ms.
-  Running long prompts through the tensor-core kernel in 64-row slices was measured too. It wins
-  only on the widest layers at 65-96 rows and loses on every shape from 128 rows, so it is not used.
-* **Against FP16 cuBLAS, INT4 compute wins only at small batches**, up to 16-32 rows. Beyond that,
-  an INT4 model buys its 4x smaller weights with slower matmuls.
+  Running long prompts through the tensor-core kernel in 64-row slices was measured too. It beats
+  dequantize + cuBLAS only on the widest layers at 65-96 rows, mostly by margins within timing noise.
+  It loses to it on every shape at 128-512 rows and to FP16 cuBLAS everywhere, so it is not used.
+* **Against FP16 cuBLAS, INT4 wins only at small batches.** Where the deployed path stops winning
+  depends on the shape, roughly 8-32 rows. Beyond that, an INT4 model pays for its smaller weights
+  with slower matmuls on most layers.
 * **The dispatch rule comes from the sweep** (on the one weight copy a model keeps):
   * 1 row: the GEMV (v6).
   * Up to 32 rows: the tensor-core kernel (v5), at most 0.82x the time of dequantize + cuBLAS on every shape.
-  * 33-64 rows: v5 only on wide layers (N >= 3072), at 0.71-0.90x; on narrower layers it no longer wins.
+  * 33-64 rows: v5 only on wide layers (N >= 3072), at 0.71-0.90x (the smaller margins are within timing noise); on narrower layers it no longer wins.
   * Beyond that: dequantize + cuBLAS.
 * **Timing on a shared T4 is noisy.** The GPU throttles under its 70 W cap; SM clock readings ranged
   330-1590 MHz. Each measurement starts after a warm-up load, and an order check calls the same
@@ -97,6 +107,8 @@ kaggle kernels push -p kernel
 python bench/report.py results/raw/a1.json results/raw/ncu_dram.csv results/raw/e2e_*.json > results/RESULTS.md
 ```
 
+Scope: the baselines are FP16 cuBLAS and the bandwidth floor, not other INT4 kernel libraries, and
+speed is measured on one prompt shape (65 tokens in, 256 out) at batch 1.
 Platform limits: the T4 has FP16 tensor cores but no BF16/FP8, and these kernels unpack weights to
 FP16, so INT4 tensor-core peak is not their ceiling. Results are from one GPU model, and other GPUs
 will place the crossovers differently. Design notes: [docs/DESIGN.md](docs/DESIGN.md).
