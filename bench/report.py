@@ -26,6 +26,27 @@ def best_variant(x):
     return k, x[k]["us"]
 
 
+def order_note(r):
+    """How far apart identical work lands when only the call order changes: the noise floor for comparing cells."""
+    if "order_check" not in r:
+        return []
+    spreads, firsts = [], []
+    for key in ("order_check", "order_check_after"):
+        for s in r.get(key, []):
+            later = [t for rnd, _, t in s["sequence"] if rnd >= 1]
+            spreads.append(max(later) / min(later) - 1)
+            firsts.append(s["sequence"][0][2] / sorted(later)[len(later) // 2] - 1)
+    clocks = sorted({x[k]["sm_mhz"] for x in r["bench"] for k in x if isinstance(x[k], dict) and x[k].get("sm_mhz")})
+    clk = (f" The SM clock read right after each measurement ranged {clocks[0]}-{clocks[-1]} MHz (the T4 throttles "
+           "under its 70 W cap), so absolute times carry that variation; compare cells within one row." if clocks else "")
+    return ["Order check: the same v6 kernel reached three ways (`gemv`, `linear()`, the raw extension call), "
+            "interleaved over three rounds on four layers, before and after the sweep. The first call of each check ran "
+            f"{min(firsts) * 100:.0f}-{max(firsts) * 100:.0f}% slow while the clock ramped; after it, identical calls "
+            f"were within {max(spreads) * 100:.0f}% of each other (median {sorted(spreads)[len(spreads) // 2] * 100:.0f}%). "
+            "Each measurement now starts after a warm-up load, but a gap of under about 20% between two cells is not "
+            "resolved by this setup." + clk, ""]
+
+
 def a1(r):
     bw, w = r["bandwidth"], r["worst_rel_err"]
     b = r["bench"]
@@ -38,7 +59,8 @@ def a1(r):
            "L2 between calls. Spread in parentheses = range of the five replay means (p10-p90), not per-call percentiles.", "",
            "Effective bandwidth = the minimum bytes an operation must move / its time. It is not a DRAM counter: an "
            "intermediate that stays in L2 (dequantize + cuBLAS at small sizes) can push it past the DRAM ceiling. "
-           "The DRAM counters are in the Nsight Compute table below.", "",
+           "The Nsight Compute DRAM-counter check (bench/ncu_dram.py) is at the end of this section, where the VM "
+           "allows performance counters.", "", *order_note(r),
            "Correctness: every kernel against an fp64 reference on the same quantized weights, M = 1..8, all shapes "
            "plus odd-N tails (v5 also at M = 12..64); each kernel's worst max-abs error / RMS(output) over all cases, "
            "next to cuBLAS's worst on the same cases (independent maxima, not a per-case comparison): " +
@@ -111,8 +133,8 @@ def ncu(text):
     body = text.split("\n# stderr")[0]
     rows = [r for r in csv.reader(io.StringIO(body)) if len(r) > 5]
     if not rows or "Metric Name" not in rows[0]:
-        tail = text.split("# stderr")[-1].strip().splitlines()[-3:]
-        return ["", "### DRAM counters (Nsight Compute)", "", "Not available on this VM: " + " / ".join(tail)[:300]]
+        err = [ln for ln in text.splitlines() if "==ERROR==" in ln] or text.split("# stderr")[-1].strip().splitlines()[-3:]
+        return ["", "### DRAM counters (Nsight Compute)", "", "Not available on this VM: " + " / ".join(err).replace("==ERROR==", "").split(". ")[0].strip() + "."]
     h = rows[0]
     ki, mi, vi, ui = (h.index(c) for c in ("Kernel Name", "Metric Name", "Metric Value", "Metric Unit"))
     idx = h.index("ID")

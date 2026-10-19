@@ -1,0 +1,4 @@
+/usr/local/cuda/bin/compute-sanitizer --tool synccheck --error-exitcode 3 /usr/bin/python3 memcheck.py
+========= COMPUTE-SANITIZER
+memcheck workload done
+========= ERROR SUMMARY: 0 errors

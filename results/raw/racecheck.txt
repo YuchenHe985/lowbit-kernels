@@ -1,0 +1,4 @@
+/usr/local/cuda/bin/compute-sanitizer --tool racecheck --error-exitcode 3 /usr/bin/python3 memcheck.py
+========= COMPUTE-SANITIZER
+memcheck workload done
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
