@@ -158,28 +158,41 @@ def e2e(rs):
     out += ["", "### Speed", "", "Decode tokens/s and TTFT (ms) on a 65-token chat prompt, 256 new tokens. Eager = plain "
             "`generate`; CUDA graph = each decode step replayed as one graph over a static KV cache.", "",
             "| model | scales | eager tok/s FP16 -> INT4 | CUDA graph tok/s FP16 -> INT4 | TTFT ms FP16 -> INT4 | peak mem GB | "
-            "graph vs eager tokens identical for |", "|---|---|---|---|---|---|---|"]
+            "graph vs eager on the same tokens: argmax agreement, worst logit diff / RMS |", "|---|---|---|---|---|---|---|"]
     for r in rs:
         f, q = r["fp16"], r["int4"]
         g = (f"{f['cuda_graph']['decode_tokens_per_s']:.1f} -> {q['cuda_graph']['decode_tokens_per_s']:.1f} "
              f"({r['speedup_decode_cuda_graph']:.2f}x)" if "speedup_decode_cuda_graph" in r else
              "failed: " + str(q.get("cuda_graph", f.get("cuda_graph", {})).get("error", "?"))[:60])
-        same = q.get("graph_vs_eager_identical_prefix")
+        fc = q.get("graph_vs_eager_forced")
+        same = (f"{100 * fc['argmax_agreement']:.1f}% of {fc['positions']}, {fc['max_logit_diff_rel']:.1e}" if fc else
+                None if q.get("graph_vs_eager_identical_prefix") is None else
+                f"first differing generated token: {q['graph_vs_eager_identical_prefix']}")
         out.append(f"| {name(r)} | {scales(r)} | "
                    f"{f['eager']['decode_tokens_per_s']:.1f} -> {q['eager']['decode_tokens_per_s']:.1f} "
                    f"({r['speedup_decode_eager']:.2f}x) | {g} | {f['eager']['ttft_ms']:.0f} -> {q['eager']['ttft_ms']:.0f} | "
                    f"{f['peak_mem_bytes'] / 1e9:.2f} -> {q['peak_mem_bytes'] / 1e9:.2f} | "
-                   f"{'-' if same is None else f'{same} tokens'} |")
-    scope = rs[0]["fp16"]["profile"].get("scope", "whole generate call, prefill included")
-    out += ["", f"Where eager decode GPU time goes (profiler, 32 steps, {scope}); GPU busy = profiled kernel time / "
-            "unprofiled wall time:", "",
-            "| model | scales | run | GPU busy | INT4 kernels | dense GEMM | dequantize | other |", "|---|---|---|---|---|---|---|---|"]
+                   f"{same or '-'} |")
+    out += ["", "Where eager decode time goes (decode only, after prefill). Graph / eager = CUDA-graph step time / eager "
+            "step time: the graph step is about the GPU's own work, so the rest of an eager step is CPU launch time. "
+            "Kernel shares come from the profiler and are shown only where its kernel time covers at least 90% of "
+            "the graph step (it can drop records on long windows).", "",
+            "| model | scales | run | eager ms/step | graph ms/step | graph / eager | profiler coverage | INT4 kernels | "
+            "dense GEMM | dequantize | other |", "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rs:
         for lab in ("fp16", "int4"):
-            p = r[lab]["profile"]
+            x, p = r[lab], r[lab]["profile"]
             s = p.get("share_pct", {})
-            out.append(f"| {name(r)} | {scales(r)} | {lab} | {p['gpu_busy_pct']:.0f}% | {s.get('int4_kernels', 0):.0f}% | "
-                       f"{s.get('gemm', 0):.0f}% | {s.get('dequant', 0):.0f}% | {s.get('other', 0):.0f}% |")
+            eager = p.get("wall_ms_per_step", p["wall_ms_unprofiled"] / p["steps"])
+            graph = p.get("graph_ms_per_step") or (1000 / x["cuda_graph"]["decode_tokens_per_s"]
+                                                    if "decode_tokens_per_s" in x.get("cuda_graph", {}) else None)
+            kern = p.get("gpu_kernel_ms_per_step", p["gpu_kernel_ms"] / p["steps"])
+            cov = kern / graph if graph else None
+            shares = (f"{s.get('int4_kernels', 0):.0f}% | {s.get('gemm', 0):.0f}% | {s.get('dequant', 0):.0f}% | "
+                      f"{s.get('other', 0):.0f}%" if cov and cov >= 0.9 else "incomplete | | |")
+            out.append(f"| {name(r)} | {scales(r)} | {lab} | {eager:.1f} | {graph:.1f} | {100 * graph / eager:.0f}% | "
+                       f"{100 * cov:.0f}% | {shares} |" if graph else
+                       f"| {name(r)} | {scales(r)} | {lab} | {eager:.1f} | - | - | - | {shares} |")
     return out
 
 

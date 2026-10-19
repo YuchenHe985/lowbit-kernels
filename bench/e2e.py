@@ -91,7 +91,8 @@ def speed_graph(tok, m, new_tokens, reps=3):
     pos = torch.zeros(1, dtype=torch.long, device="cuda")
 
     def step():
-        return m(input_ids=tok_in, past_key_values=cache, cache_position=pos, use_cache=True).logits[:, -1].argmax(-1)
+        lg = m(input_ids=tok_in, past_key_values=cache, cache_position=pos, use_cache=True).logits[:, -1]
+        return lg, lg.argmax(-1)
 
     def prefill():
         cache.reset()
@@ -108,7 +109,7 @@ def speed_graph(tok, m, new_tokens, reps=3):
     torch.cuda.current_stream().wait_stream(s)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = step()
+        out_logits, out = step()
     toks = torch.empty(new_tokens, dtype=torch.long, device="cuda")
     ttft, dec = [], []
     for _ in range(reps):
@@ -124,8 +125,43 @@ def speed_graph(tok, m, new_tokens, reps=3):
             toks[i] = out[0]
         torch.cuda.synchronize(); dec.append(time.perf_counter() - t)
     ttft.sort(); dec.sort()
+
+    @torch.inference_mode()
+    def forced(seq):
+        """Logits of the graph step for each token of `seq` fed in turn after the prompt (teacher forcing)."""
+        first = prefill_logits()
+        rows = [first]
+        for i, t in enumerate(seq[:-1]):
+            tok_in.fill_(t); pos.fill_(p + i)
+            graph.replay()
+            rows.append(out_logits[0].float().clone())
+        return torch.stack(rows)
+
+    @torch.inference_mode()
+    def prefill_logits():
+        cache.reset()
+        return m(input_ids=ids, past_key_values=cache, cache_position=torch.arange(p, device="cuda"),
+                 use_cache=True).logits[0, -1].float()
+
     return {"prompt_tokens": p, "new_tokens": new_tokens, "ttft_ms": 1000 * ttft[len(ttft) // 2],
-            "decode_tokens_per_s": (new_tokens - 1) / dec[len(dec) // 2]}, toks.tolist()
+            "decode_tokens_per_s": (new_tokens - 1) / dec[len(dec) // 2]}, toks.tolist(), forced
+
+
+@torch.inference_mode()
+def eager_forced(tok, m, seq):
+    """The same teacher-forced logits through plain eager forward with a dynamic cache."""
+    ids = prompt_ids(tok)
+    cache = dynamic_cache()
+    rows = [m(input_ids=ids, past_key_values=cache, use_cache=True).logits[0, -1].float()]
+    for t in seq[:-1]:
+        rows.append(m(input_ids=torch.tensor([[t]], device="cuda"), past_key_values=cache, use_cache=True).logits[0, -1].float())
+    return torch.stack(rows)
+
+
+def compare_logits(a, b):
+    rms = b.pow(2).mean(-1).sqrt()
+    return {"positions": a.shape[0], "argmax_agreement": (a.argmax(-1) == b.argmax(-1)).float().mean().item(),
+            "max_logit_diff_rel": ((a - b).abs().amax(-1) / rms).max().item()}
 
 
 def dynamic_cache():
@@ -134,11 +170,12 @@ def dynamic_cache():
 
 
 @torch.inference_mode()
-def where_time_goes(tok, m, steps=32):
+def where_time_goes(tok, m, steps=32, prof_steps=8):
     """Eager decode only (the prompt is prefilled first, outside the window): `steps` single-token steps on the
-    timed workload's prompt, once unprofiled for the wall time, once under the profiler for GPU time by kernel,
-    grouped into INT4 kernels / dense GEMM / dequantize / the rest. GPU busy = profiled kernel time / unprofiled
-    wall time."""
+    timed workload's prompt, once unprofiled for the wall time, once under the profiler (`prof_steps` steps: over
+    ~25k kernels in one window the profiler dropped records on the 3B model) for GPU time by kernel, grouped into
+    INT4 kernels / dense GEMM / dequantize / the rest. GPU busy = profiled kernel time per step / unprofiled wall
+    time per step."""
     from torch.profiler import ProfilerActivity, profile
     ids = prompt_ids(tok)
 
@@ -157,7 +194,7 @@ def where_time_goes(tok, m, steps=32):
     nxt = m(input_ids=ids, past_key_values=cache, use_cache=True).logits[:, -1].argmax(-1, keepdim=True)
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:          # the decode steps only
-        for _ in range(steps):
+        for _ in range(prof_steps):
             nxt = m(input_ids=nxt, past_key_values=cache, use_cache=True).logits[:, -1].argmax(-1, keepdim=True)
         torch.cuda.synchronize()
     rows = [(e.key, e.device_time_total if hasattr(e, "device_time_total") else e.cuda_time_total)
@@ -170,8 +207,10 @@ def where_time_goes(tok, m, steps=32):
              "gemm" if any(s in k.lower() for s in ("gemm", "gemv", "cutlass", "turing_", "volta_")) else "other")
         groups[g] += us
     top = sorted(kern, key=lambda r: -r[1])[:12]
-    return {"steps": steps, "scope": "decode only, after prefill", "wall_ms_unprofiled": 1000 * wall,
-            "gpu_kernel_ms": gpu / 1000, "gpu_busy_pct": 100 * gpu / 1000 / (1000 * wall),
+    return {"steps": steps, "prof_steps": prof_steps, "scope": "decode only, after prefill",
+            "wall_ms_unprofiled": 1000 * wall, "wall_ms_per_step": 1000 * wall / steps,
+            "gpu_kernel_ms": gpu / 1000, "gpu_kernel_ms_per_step": gpu / 1000 / prof_steps,
+            "gpu_busy_pct": 100 * (gpu / 1000 / prof_steps) / (1000 * wall / steps),
             "share_pct": {g: 100 * v / gpu for g, v in groups.items()} if gpu else {},
             "top_kernels": [{"name": k[:90], "ms": us / 1000} for k, us in top]}
 
@@ -241,19 +280,24 @@ def measure(tok, m, label, a, ref_argmax=None, speed=True):
     torch.cuda.reset_peak_memory_stats()
     r = {"label": label, "weight_bytes": weight_bytes(m)}
     r["wikitext2"], argmax = quality(a.ppl_ids, m, a.ppl_windows, ref_argmax)
-    toks = None
+    toks = forced = None
     if speed:
         r["eager"] = speed_eager(tok, m, a.new_tokens)
         try:
-            r["cuda_graph"], toks = speed_graph(tok, m, a.new_tokens)
+            r["cuda_graph"], toks, forced = speed_graph(tok, m, a.new_tokens)
         except Exception as e:                                            # report it, keep the eager numbers
             r["cuda_graph"] = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
         r["profile"] = where_time_goes(tok, m)
+        if "decode_tokens_per_s" in r["cuda_graph"]:                      # GPU work per step, no profiler needed
+            r["profile"]["graph_ms_per_step"] = 1000 / r["cuda_graph"]["decode_tokens_per_s"]
         if toks is not None:                                              # graph replay vs plain generate, same prompt
             ids = prompt_ids(tok)
             eager = m.generate(ids, max_new_tokens=a.new_tokens, min_new_tokens=a.new_tokens, do_sample=False,
                                pad_token_id=tok.eos_token_id)[0, ids.shape[1]:].tolist()
             r["graph_vs_eager_identical_prefix"] = first_diff(eager, toks)
+            # one flipped near-tie makes every later token differ, so also feed the SAME tokens through both paths
+            seq = eager[:128]
+            r["graph_vs_eager_forced"] = compare_logits(forced(seq), eager_forced(tok, m, seq))
         r["peak_mem_bytes"] = torch.cuda.max_memory_allocated()
     print(label, json.dumps({k: v for k, v in r.items() if k != "profile"}), flush=True)
     if "profile" in r:
