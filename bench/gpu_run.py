@@ -66,6 +66,30 @@ def env():
             "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
+_HEAT = None
+
+
+def heat(ms=60):
+    """Keep the GPU busy for about `ms` so its clocks are at their loaded level before a measurement. A T4 left idle
+    for a moment drops its SM clock, and a small layer's time then moves by up to 1.7x (measured: the same v6 call
+    5.4 vs 9.2 us depending on what ran before it)."""
+    global _HEAT
+    if _HEAT is None:
+        _HEAT = torch.randn(2048, 2048, device="cuda", dtype=torch.half)
+    t0 = time.time()
+    while time.time() - t0 < ms / 1000:
+        for _ in range(4):
+            _HEAT @ _HEAT
+        torch.cuda.synchronize()
+
+
+def sm_clock_mhz():
+    try:
+        return int(torch.cuda.clock_rate())
+    except Exception:
+        return None
+
+
 def timed(fn, warmup=20, iters=100, rounds=5):
     """Per-call GPU time in microseconds: each of `rounds` replays of a CUDA graph holding `iters` calls gives one
     mean; we report the median of those means and their spread (`p10`/`p90` across the rounds, not per-call
@@ -92,6 +116,7 @@ def timed(fn, warmup=20, iters=100, rounds=5):
         mode = "eager"
     run()
     torch.cuda.synchronize()
+    heat()
     per = []
     for _ in range(rounds):
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -102,7 +127,7 @@ def timed(fn, warmup=20, iters=100, rounds=5):
         per.append(a.elapsed_time(b) * 1000 / iters)
     per.sort()
     return {"us": float(np.median(per)), "p10": float(np.percentile(per, 10)), "p90": float(np.percentile(per, 90)),
-            "timing": mode}
+            "timing": mode, "sm_mhz": sm_clock_mhz()}
 
 
 def bandwidth():
@@ -276,6 +301,27 @@ def bench(shapes, rows_decode, rows_prefill, peak):
     return res
 
 
+def order_check(peak_unused=None, names=("qwen0.5b.q_proj", "qwen0.5b.down", "qwen1.5b.q_proj", "qwen3b.gate_up")):
+    """M = 1: the same v6 call timed directly, through linear() and through the raw extension, interleaved three
+    times, so a gap between them is a real cost and not GPU clock state left by the timing before it."""
+    out = []
+    for name, k, n in [s for s in SHAPES if s[0] in names]:
+        w4_bytes = n * k // 2 + n * (k // GROUP) * 2
+        wqs = [ops.W4Weight.from_float(torch.randn(n, k), GROUP, ("mma",)) for _ in range(max(2, -(-L2_FLUSH_BYTES // w4_bytes)))]
+        nxt = iter(range(1 << 62))
+        pick = lambda: wqs[next(nxt) % len(wqs)]
+        x = torch.randn(1, k).half().cuda()
+        it = max(100, len(wqs))
+        calls = {"gemv_v6": lambda: ops.gemv(x, pick(), 6), "linear": lambda: ops.linear(x, pick()),
+                 "ext_raw": lambda: (lambda w: ops.ext().w4_gemv(x, w.packed_mma, w.scales, w.group, 6, 0))(pick())}
+        seq = [(rep, key, timed(fn, iters=it)["us"]) for rep in range(3) for key, fn in calls.items()]
+        out.append({"shape": name, "K": k, "N": n, "sequence": seq})
+        print(name, " ".join(f"{key}={us:.1f}" for _, key, us in seq), flush=True)
+        wqs = None
+        torch.cuda.empty_cache()
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="results/a1.json")
@@ -302,7 +348,9 @@ def main():
         result["bandwidth"] = bw
         result["spec_bandwidth_gbps"] = 320.0 if "T4" in result["env"]["gpu"] else None
         print(f"bandwidth {bw}", flush=True)
+        result["order_check"] = order_check()
         result["bench"] = bench(shapes, [1, 2, 4, 8], [16, 32, 64] if a.quick else [16, 32, 64, 65, 96, 128, 192, 256, 384, 512, 1024], peak)
+        result["order_check_after"] = order_check()
     pathlib.Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(a.out).write_text(json.dumps(result, indent=1))
     sys.exit(0 if ok else 1)
